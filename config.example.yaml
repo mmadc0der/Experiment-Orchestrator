@@ -1,0 +1,19 @@
+# m:\Projects\Experiment Orchestrator\app_config.yaml
+# Configuration for the "Experiment Orchestrator" application
+
+# Default path for saving artifacts of all experiments
+# Can be overridden in the specific experiment configuration
+default_experiments_output_base_path: "./orchestrator_experiments_output" # Relative to the project root
+
+# Logging settings for the orchestrator
+logging:
+  level: "INFO"  # DEBUG, INFO, WARNING, ERROR, CRITICAL
+  format: "%(asctime)s %(levelname)s [%(process)d:%(threadName)s] %(funcName)s: %(message)s"
+  # file_path: "orchestrator.log" # Optionally: log to file
+
+# Default resources (can be overridden by the experiment)
+default_resources:
+  device: "cpu" # 'cpu', 'cuda', 'cuda:0', 'mps'
+
+# Default directory where experiment YAML configuration files are stored
+default_experiment_configs_dir: "./configs"

@@ -1,0 +1,256 @@
+# m:\Projects\Experiment Orchestrator\configs\example.manifest.yaml
+# This file is used for collaborative development and clarification
+# of definitions (manifests) for various resources in the experiment orchestration system.
+
+# -----------------------------------------------------------------------------
+# Resource: Environment
+# Describes the execution environment for experiment tasks.
+# -----------------------------------------------------------------------------
+apiVersion: orchestrator.windsurf.ai/v1alpha1 # Use custom apiGroup
+kind: Environment
+metadata:
+  name: python-3.9-pytorch-cuda11
+  labels:
+    owner: "ml-platform-team"
+    purpose: "deep-learning-training"
+spec:
+  description: "Standard environment for training models on PyTorch with CUDA 11 support."
+  type: "docker" # Possible types: "docker", "conda", "venv", "bare_metal"
+  image: "pytorch/pytorch:1.10.1-cuda11.3-cudnn8-runtime" # If type: "docker"
+  # pythonVersion: "3.9" # If type: "conda" or "venv"
+  # condaEnvName: "my_env_name" # If type: "conda"
+  # venvPath: "/path/to/shared/venvs/my_venv" # If type: "venv"
+  requirementsFile: "requirements/pytorch_env.txt" # Path to dependency file (relative to project root or URL)
+  setupCommands: # Additional commands for environment setup
+    - "pip install --no-cache-dir -U pip"
+    - "pip install --no-cache-dir scikit-learn pandas"
+  envVariables: # Environment variables for tasks using this Env
+    - name: "CUDA_VISIBLE_DEVICES"
+      value: "0"
+    - name: "NCCL_DEBUG"
+      value: "INFO"
+
+---
+# -----------------------------------------------------------------------------
+# Resource: Data
+# Describes the data source, data loading method, and configuration.
+# -----------------------------------------------------------------------------
+apiVersion: orchestrator.windsurf.ai/v1alpha1
+kind: Data
+metadata:
+  name: cifar10-dataset
+  labels:
+    dataset_group: "image-classification"
+    access_level: "public"
+spec:
+  description: "Датасет CIFAR-10 для задач классификации изображений."
+  type: "torchvision_dataset" # Types: "local_files", "s3_bucket", "gcs_bucket", "database", "custom_module", "torchvision_dataset"
+  # uri: "s3://my-ml-data-lake/cifar10/" # If type: "s3_bucket" or "local_files"
+  # format: "parquet" # If type: "local_files", "s3_bucket", etc.
+  
+  # If using a custom loader or a known dataset type
+  loaderModule: "torchvision.datasets.CIFAR10" # Path to class/factory dataset
+  # loaderFunction: "load_cifar10_data" # Alternatively, if it's a function
+
+  config: # Parameters passed to loaderModule/loaderFunction
+    root: "./data_cache/cifar10" # Where to download or find the data
+    train: true # Specific parameter for CIFAR10 (train/test split)
+    download: true
+    transform: # Can be a string with a reference to another "Transform" resource or inline definition
+      modulePath: "torchvision.transforms.Compose"
+      params:
+        - modulePath: "torchvision.transforms.ToTensor"
+          params: {}
+        - modulePath: "torchvision.transforms.Normalize"
+          params:
+            mean: [0.4914, 0.4822, 0.4465]
+            std: [0.2023, 0.1994, 0.2010]
+  
+  # Optionally: data schema (for validation or information)
+  # schema:
+  #   features:
+  #     - name: "image"
+  #       type: "tensor"
+  #       shape: [3, 32, 32]
+  #     - name: "label"
+  #       type: "integer"
+  #   target: "label"
+
+---
+# -----------------------------------------------------------------------------
+# Resource: Model
+# Describes the architecture of the model, how to initialize it, and configuration.
+# -----------------------------------------------------------------------------
+apiVersion: orchestrator.windsurf.ai/v1alpha1
+kind: Model
+metadata:
+  name: resnet18-cifar10
+  labels:
+    architecture: "resnet"
+    task_type: "image-classification"
+spec:
+  description: "ResNet-18 model adapted for CIFAR-10 classification."
+  # Model definition method:
+  sourceType: "module" # "module", "pretrained_hub", "onnx_file", "custom_script"
+  
+  modulePath: "torchvision.models.resnet18" # Path to class/factory model
+  # functionName: "create_resnet18_model" # If using a factory function
+
+  # Configuration passed to constructor/factory function
+  config:
+    pretrained: false # Load pre-trained weights (if supported by the module)
+    num_classes: 10   # Number of output classes
+
+  # Optionally: information about input/output tensors (for validation or graph assembly)
+  # input_signature:
+  #   - name: "input_image"
+  #     shape: [-1, 3, 32, 32] # -1 для batch size
+  #     dtype: "float32"
+  # output_signature:
+  #   - name: "logits"
+  #     shape: [-1, 10]
+  #     dtype: "float32"
+
+---
+# -----------------------------------------------------------------------------
+# Resource: TaskDefinition - Task type definition
+# Describes a template for a specific operation, such as "training" or "evaluation".
+# Concrete task instances will be created in the Experiment manifest.
+# -----------------------------------------------------------------------------
+apiVersion: orchestrator.windsurf.ai/v1alpha1
+kind: TaskDefinition
+metadata:
+  name: pytorch-train-task
+  labels:
+    framework: "pytorch"
+    operation: "training"
+spec:
+  description: "Definition of a training task for PyTorch models."
+  # Link to the module/script that executes this task
+  # This module will receive links to Model, Data, Env, and parameters from Experiment.
+  executorModule: "orchestrator_tasks.pytorch.train:run_training_task"
+  
+  # Definition of expected input parameters (specific to the task)
+  # These parameters will be provided when instantiating the task in the Experiment.
+  # Schema can use JSON Schema.
+  parametersSchema:
+    type: object
+    properties:
+      epochs: { type: "integer", default: 10, description: "Number of epochs for training." }
+      learning_rate: { type: "number", default: 0.001 }
+      optimizer_name: { type: "string", enum: ["Adam", "SGD", "AdamW"], default: "AdamW" }
+      optimizer_params: { type: "object", description: "Additional optimizer parameters." }
+      loss_function_name: { type: "string", default: "CrossEntropyLoss" }
+      loss_function_params: { type: "object" }
+    required: ["epochs"]
+
+  # Definition of expected input artifacts or links to other resources
+  inputsSchema:
+    type: object
+    properties:
+      model: { type: "string", description: "Link (metadata.name) to the Model resource." }
+      training_data: { type: "string", description: "Link to the Data resource for training." }
+      validation_data: { type: "string", description: "Link to the Data resource for validation (optional)." }
+      environment: { type: "string", description: "Link to the Environment resource." }
+    required: ["model", "training_data", "environment"]
+
+  # Definition of expected output artifacts:
+    type: object
+    properties:
+      trained_model_path: { type: "string", description: "Path to the saved trained model." }
+      training_logs_path: { type: "string", description: "Path to training logs." }
+      metrics_path: { type: "string", description: "Path to metrics file." }
+    required: ["trained_model_path"]
+
+---
+# -----------------------------------------------------------------------------
+# Resource: Experiment
+# Defines one or more task runs with possible parameterization.
+# -----------------------------------------------------------------------------
+apiVersion: orchestrator.windsurf.ai/v1alpha1
+kind: Experiment
+metadata:
+  name: resnet18-lr-sweep-cifar10-01
+  labels:
+    project: "image-classification-research"
+    owner: "data_scientist_jane"
+spec:
+  description: "Learning rate sweep for ResNet-18 on CIFAR-10 with AdamW optimizer."
+
+  # Common resource definitions used in tasks of this experiment
+  # These are links to names of Model, Data, Environment, TaskDefinition resources
+  commonResourceRefs:
+    modelDefinition: "resnet18-cifar10"
+    trainingData: "cifar10-dataset" # Assuming loaderModule can provide train/val splits
+    # validationData: "cifar10-dataset-val" # Or a separate resource for validation
+    environment: "python-3.9-pytorch-cuda11"
+    trainingTaskDefinition: "pytorch-train-task"
+    # evaluationTaskDefinition: "pytorch-evaluate-task" # If there is an evaluation task
+
+  # Strategy for parameterization to create multiple "runs/trials"
+  # Each element in 'matrix' creates one or more parameter sets.
+  # Here it's a simple list, but can be 'grid', 'random', etc.
+  parameterSpace:
+    # Parameter name must match expected in TaskDefinition.parametersSchema
+    # or in Model.config, if the task allows overriding model parameters.
+    matrix:
+      - learning_rate: 0.01
+        optimizer_params: { "beta1": 0.9, "beta2": 0.999 } # For AdamW
+      - learning_rate: 0.005
+        optimizer_params: { "beta1": 0.9, "beta2": 0.998 }
+      - learning_rate: 0.001
+        optimizer_params: { "beta1": 0.89, "beta2": 0.99 }
+
+  # Template for naming created instances (e.g., ModelInstance)
+  # Available variables: $(Experiment.metadata.name), $(Task.name), $(Run.index),
+  # $(Param.learning_rate), $(uuid_short), etc.
+  instanceNameTemplate: "$(Experiment.metadata.name)-run$(Run.index)-lr$(Param.learning_rate:.0e)-{uuid_short}"
+
+  # Defines the pipeline of tasks for each parameter set from parameterSpace
+  pipeline:
+    - name: "train-resnet" # Logical name of the step in the pipeline
+      taskDefinitionRef: $(commonResourceRefs.trainingTaskDefinition)
+      # Inputs for the task (links to common resources)
+      inputs:
+        model: $(commonResourceRefs.modelDefinition)
+        training_data: $(commonResourceRefs.trainingData)
+        # validation_data: $(commonResourceRefs.validationData) # If used
+        environment: $(commonResourceRefs.environment)
+      
+      # Parameters for the training task.
+      # $(Param.learning_rate) and $(Param.optimizer_params) will be taken from parameterSpace.
+      parameters:
+        epochs: 20 # Fixed parameter for all runs in this experiment
+        learning_rate: $(Param.learning_rate)
+        optimizer_name: "AdamW" # Fixed optimizer
+        optimizer_params: $(Param.optimizer_params)
+        loss_function_name: "CrossEntropyLoss"
+
+      # Description of which output artifacts of this task should be registered
+      # as new resource instances (e.g., ModelInstance).
+      # Keys here (e.g., 'trained_model') must correspond to keys in
+      # outputsSchema from TaskDefinition 'pytorch-train-task'.
+      # The orchestrator uses this information to create ModelInstance.
+      outputsToRegister:
+        trained_model_path: # From outputsSchema.properties.trained_model_path
+          kind: ModelInstance # What type of resource instance to create
+          # Instance name will be generated by instanceNameTemplate
+          # Other ModelInstance fields (metrics, artifacts.path) will be filled
+          # by the orchestrator based on the actual results of executorModule execution.
+
+    # You can add other steps, for example, evaluating each trained model:
+    # - name: "evaluate-resnet"
+    #   taskDefinitionRef: $(commonResourceRefs.evaluationTaskDefinition)
+    #   dependsOn: ["train-resnet"] # Depends on the completion of the training step for the same parameter set
+    #   inputs:
+    #     # Link to ModelInstance, created on the previous step.
+    #     # The orchestrator should provide a mechanism for linking to the output of the previous step.
+    #     # For example: $(steps.train-resnet.outputs.trained_model_path.instanceName)
+    #     modelInstance: "$(instanceNameTemplate)" # Link to ModelInstance, created on the train-resnet step
+    #     test_data: $(commonResourceRefs.trainingData) # Assuming loader can provide test split
+    #     environment: $(commonResourceRefs.environment)
+    #   parameters:
+    #     metrics_to_calculate: ["accuracy", "precision", "recall"]
+    #   outputsToRegister:
+    #     evaluation_results:
+    #       kind: MetricSet # Or another appropriate artifact type
