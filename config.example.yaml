@@ -1,19 +1,18 @@
 # m:\Projects\Experiment Orchestrator\app_config.yaml
 # Configuration for the "Experiment Orchestrator" application
 
-# Default path for saving artifacts of all experiments
-# Can be overridden in the specific experiment configuration
-default_experiments_output_base_path: "./orchestrator_experiments_output" # Relative to the project root
-
 # Logging settings for the orchestrator
 logging:
-  level: "INFO"  # DEBUG, INFO, WARNING, ERROR, CRITICAL
+  file_level: "INFO"  # DEBUG, INFO, WARNING, ERROR, CRITICAL
+  console_level: "WARNING"  # DEBUG, INFO, WARNING, ERROR, CRITICAL
   format: "%(asctime)s %(levelname)s [%(process)d:%(threadName)s] %(funcName)s: %(message)s"
-  # file_path: "orchestrator.log" # Optionally: log to file
+  rotation:
+    max_bytes: 10*1024*1024 # 10 MB
+    backup_count: 32
 
-# Default resources (can be overridden by the experiment)
-default_resources:
-  device: "cpu" # 'cpu', 'cuda', 'cuda:0', 'mps'
+paths:
+  modules_root: "modules"       # Directory for user-defined Python modules
+  artifacts_root: "artifacts"   # Root directory for storing experiment artifacts
+  runtime_root: "runtime"       # Root directory for storing runtime data
+  log_dir: "log"                # Directory for log files (as used by logger.py)
 
-# Default directory where experiment YAML configuration files are stored
-default_experiment_configs_dir: "./configs"

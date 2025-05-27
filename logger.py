@@ -26,7 +26,7 @@ class CustomRotatingFileHandler(RotatingFileHandler):
             os.rename(self.baseFilename, dfn)
         self.stream = self._open()
 
-def init_logging(file_level=logging.INFO, console_level=logging.WARNING, log_dir="log", log_file_name="experiment-orchestrator", log_format="%(asctime)s %(levelname)s [%(process)d:%(threadName)s] %(funcName)s: %(message)s"):
+def init_logging(file_level=logging.INFO, console_level=logging.WARNING, log_dir="log", log_file_name="experiment-orchestrator", log_format="%(asctime)s %(levelname)s [%(process)d:%(threadName)s] %(funcName)s: %(message)s", max_bytes=10*1024*1024, backup_count=5):
     """
     Initializes logging: root logger, console and file handler with rotation.
     Logs are written to log/experiment-orchestrator_YYYYMMDD.log and archives experiment-orchestrator_YYYYMMDD.NN.log
@@ -47,10 +47,10 @@ def init_logging(file_level=logging.INFO, console_level=logging.WARNING, log_dir
     log_file_base = log_dir / f"{log_file_name}_{datetime.now().strftime('%Y-%m-%d')}.log"
     file_handler = CustomRotatingFileHandler(
         str(log_file_base),
-        maxBytes=10*1024*1024,
-        backupCount=5
+        maxBytes=max_bytes,
+        backupCount=backup_count
     )
     file_handler.setFormatter(log_formatter)
     file_handler.setLevel(file_level)
     logger.addHandler(file_handler)
-    logging.info("Logging configured: Console=%s, File=%s (%s)", console_level, file_level, str(log_file_base))
+    logging.info(f"Logging configured: Console={logging.getLevelName(console_level)}, File={logging.getLevelName(file_level)} ({str(log_file_base)})")

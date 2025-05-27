@@ -1,0 +1,16 @@
+apiVersion: orchestrator.windsurf.ai/v1alpha1
+kind: Model
+metadata:
+  name: resnet18-cifar10
+  labels:
+    architecture: "resnet"
+    task_type: "image-classification"
+spec:
+  description: "ResNet-18 model adapted for CIFAR-10 classification."
+  sourceType: "module"  
+  
+  modulePath: "torchvision.models.resnet18"
+
+  config:
+    pretrained: false 
+    num_classes: 10 
