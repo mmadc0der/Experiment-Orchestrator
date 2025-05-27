@@ -38,10 +38,11 @@ class JobStepDefinition(BaseModel):
     executor: str = Field(..., description="Reference to the executable for this job, e.g., 'module.submodule.ClassName' or 'docker_image_uri'")
     parameters: Optional[Dict[str, Any]] = Field(default_factory=dict, description="Parameters to pass to the job executor. Can use templating from task parameters or outputs of previous steps.")
     inputs: Optional[Dict[str, str]] = Field(default_factory=dict, description="Mapping of job's input artifact names to task's input artifact names or outputs of other steps (e.g., '{{inputs.task_input_name}}' or '{{steps.prev_step_name.outputs.artifact_name}}')")
-    outputs: Optional[List[str]] = Field(default_factory=list, description="List of logical names for artifacts produced by this job step")
+    outputs_templates: Optional[Dict[str, str]] = Field(default_factory=dict, description="Mapping of logical output artifact names to their filename templates. E.g., {'model': 'model-{{parameters.version}}.pkl'}")
     depends_on: Optional[List[str]] = Field(default_factory=list, description="List of other JobStepDefinition names within the same task that this step depends on")
-    resources: Optional[ResourceRequirements] = None
+    resources_request: Optional[ResourceRequirements] = Field(default=None, alias="resources", description="Resource requirements for this job step. Aliased as 'resources' for YAML manifest.")
     retry_policy: Optional[Dict[str, Any]] = Field(default_factory=dict, description="Policy for retrying the job on failure, e.g., {'max_attempts': 3, 'backoff_seconds': 60}")
+    priority: int = Field(default=0, description="Job priority, higher numbers typically mean higher priority")
     # on_condition: Optional[str] = Field(None, description="A condition string to evaluate for executing this step")
 
 # --- Task Definition ---
