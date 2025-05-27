@@ -131,6 +131,25 @@ class ManifestExpander:
 
         # TODO: Добавить валидацию, что все task_reference в ExperimentDefinition существуют в self.task_defs
 
+    def process_manifest(self) -> Tuple[ExperimentInstance, List[TaskInstance], List[JobInstance]]:
+        """
+        Processes the loaded manifest documents by expanding the experiment definition.
+
+        Returns:
+            A tuple containing the ExperimentInstance, a list of TaskInstances,
+            and a list of JobInstances.
+
+        Raises:
+            RuntimeError: If no ExperimentDefinition was loaded or found.
+        """
+        if not self.experiment_def:
+            # Эта ошибка также может быть вызвана из _parse_and_categorize_definitions,
+            # но дублируем проверку для ясности и как публичный контракт метода.
+            raise RuntimeError("Cannot process manifest: No ExperimentDefinition loaded. Ensure the manifest contains a valid 'Experiment' document.")
+        
+        logger.info(f"Processing manifest for experiment: {self.experiment_def.metadata.get('name')}")
+        return self.expand_experiment()
+
     def expand_experiment(self) -> Tuple[ExperimentInstance, List[TaskInstance], List[JobInstance]]:
         """
         Expands the loaded ExperimentDefinition into a graph of instances,

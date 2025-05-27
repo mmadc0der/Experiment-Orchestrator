@@ -9,7 +9,8 @@ from pydantic import BaseModel
 
 from logger import init_logging
 logger = custom_logging.getLogger(__name__)
-from manifest_parser import ManifestParser
+from manifest_processing.manifest_parser import ManifestParser
+from manifest_processing.manifest_expander import ManifestExpander
 
 CONFIG_FILE_NAME = "config.example.yaml"
 DEFAULT_LOG_FORMAT = "%(asctime)s %(levelname)s [%(process)d:%(threadName)s] %(funcName)s: %(message)s"
@@ -111,45 +112,95 @@ class Orchestrator:
         return self._process_parsed_manifest_data(manifest_data_list, "string content")
 
     def _process_parsed_manifest_data(self, manifest_data_list: list[dict], source_description: str) -> dict:
-        """
-        Common logic for processing parsed manifest data.
-        This method will eventually trigger the actual scheduling/execution of resources.
-        """
         if not manifest_data_list:
             logger.warning(f"No documents found or parsed from manifest {source_description}")
             return {"status": "warning", "message": f"No documents found or parsed from manifest {source_description}"}
 
         logger.info(f"Successfully parsed {len(manifest_data_list)} document(s) from {source_description}.")
         
-        processed_kinds = []
-        # TODO: Main logic for processing each document in the manifest
-        # This will involve identifying the 'kind' and dispatching to appropriate handlers/schedulers.
+        experiment_instance = None
+        task_instances = []
+        job_instances = []
+        expansion_successful = False
+        expansion_error_message = ""
+        all_kinds_in_manifest = [doc.get('kind') for doc in manifest_data_list if doc.get('kind')]
+
+        # Attempt to expand if an ExperimentDefinition might be present
+        # ManifestExpander will internally check for ExperimentDefinition and raise error if not suitable
+        # We only try to expand if 'ExperimentDefinition' is one of the kinds found.
+        if "Experiment" in all_kinds_in_manifest:
+            try:
+                logger.info("Experiment kind found. Initializing ManifestExpander with parsed documents.")
+                expander = ManifestExpander(raw_manifest_docs=manifest_data_list)
+                
+                logger.info("Attempting to expand manifest using ManifestExpander.process_manifest().")
+                experiment_instance, task_instances, job_instances = expander.process_manifest()
+                
+                expansion_successful = True
+                logger.info(f"ManifestExpander successfully processed and expanded the experiment part of the manifest.")
+                if experiment_instance:
+                    logger.info(f"Generated ExperimentInstance: ID={experiment_instance.id}, Name={experiment_instance.name}")
+                logger.info(f"Generated {len(task_instances)} TaskInstance(s) and {len(job_instances)} JobInstance(s).")
+
+            except RuntimeError as e:
+                logger.warning(f"ManifestExpander could not expand an experiment from the manifest: {e}. This may be expected if the ExperimentDefinition is invalid or incomplete.")
+                expansion_error_message = str(e) 
+            except Exception as e:
+                logger.error(f"Unexpected error during ManifestExpander processing: {e}", exc_info=True)
+                expansion_error_message = f"Unexpected internal error during expansion: {e}"
+        else:
+            logger.info("No Experiment kind found in manifest. Skipping experiment expansion.")
+            expansion_error_message = "No Experiment kind found in manifest to expand."
+
+        # Process/report on all documents based on expansion outcome
+        processed_doc_details = []
         for i, doc_data in enumerate(manifest_data_list):
             kind = doc_data.get('kind')
-            name = doc_data.get('metadata', {}).get('name')
-            logger.info(f"Processing document {i+1} from {source_description}: kind='{kind}', name='{name}'")
-            
-            # Здесь будет логика маршрутизации в зависимости от 'kind'
-            # Например, если kind == "Experiment", вызвать _schedule_experiment(doc_data)
-            # если kind == "Dataset", вызвать _register_dataset(doc_data) и т.д.
-            if kind == "Experiment": # Оставим пока для примера
-                self._handle_experiment_resource(doc_data) # Переименовано для ясности
-            # Другие виды ресурсов
-            # elif kind == "Model":
-            #     self._handle_model_resource(doc_data)
-            else:
-                logger.info(f"Resource kind '{kind}' (name: '{name}') acknowledged. Specific processing TBD.")
+            name = doc_data.get('metadata', {}).get('name', 'N/A')
 
-            processed_kinds.append(kind)
+            if kind == "Experiment":
+                if expansion_successful:
+                    status_msg = "expanded_as_part_of_experiment"
+                    logger.info(f"Document {i+1} (Kind: {kind}, Name: {name}) was part of the successful experiment expansion.")
+                else:
+                    status_msg = "expansion_failed_or_not_applicable"
+                    logger.warning(f"Document {i+1} (Kind: {kind}, Name: {name}) found, but expansion failed. Error: {expansion_error_message}")
+                processed_doc_details.append({"kind": kind, "name": name, "status": status_msg, "error_if_any": expansion_error_message if not expansion_successful else None})
+            elif kind == "Task" and "Experiment" in all_kinds_in_manifest:
+                 # If there was an attempt to expand an experiment, TaskDefinitions are considered 'used' or 'related'
+                status_msg = "used_by_expander_attempt" if expansion_successful else "related_to_failed_expansion_attempt"
+                logger.info(f"Document {i+1} (Kind: {kind}, Name: {name}) was potentially used by ManifestExpander (success: {expansion_successful}).")
+                processed_doc_details.append({"kind": kind, "name": name, "status": status_msg})
+            else:
+                logger.info(f"Document {i+1} (Kind: {kind}, Name: {name}) acknowledged. Specific processing for this kind TBD.")
+                processed_doc_details.append({"kind": kind, "name": name, "status": "acknowledged_other_kind"})
         
-        logger.info(f"Finished initial processing of manifest from {source_description}.")
-        # Возвращаем более общий ответ
-        return {
-            "status": "accepted", # Изменено на "accepted"
-            "message": f"Manifest from {source_description} with {len(manifest_data_list)} document(s) accepted for processing.",
-            "processed_doc_count": len(manifest_data_list),
-            "processed_kinds": processed_kinds # Оставляем для информации
-        }
+        if expansion_successful:
+            return {
+                "status": "accepted_experiment_expanded",
+                "message": "Experiment successfully expanded. Other resources acknowledged.",
+                "expansion_details": {
+                    "experiment_instance_id": experiment_instance.id if experiment_instance else None,
+                    "task_instance_count": len(task_instances),
+                    "job_instance_count": len(job_instances)
+                },
+                "processed_documents": processed_doc_details,
+                "all_kinds_in_manifest": list(set(all_kinds_in_manifest))
+            }
+        elif "Experiment" in all_kinds_in_manifest: # An experiment was defined but couldn't be expanded
+             return {
+                "status": "error_experiment_expansion",
+                "message": f"Failed to expand ExperimentDefinition from manifest. Error: {expansion_error_message or 'Unknown expansion error'}",
+                "processed_documents": processed_doc_details,
+                "all_kinds_in_manifest": list(set(all_kinds_in_manifest))
+            }
+        else: # No ExperimentDefinition, other kinds processed
+            return {
+                "status": "accepted_other_kinds",
+                "message": "Manifest processed. No Experiment kind found to expand; other kinds acknowledged.",
+                "processed_documents": processed_doc_details,
+                "all_kinds_in_manifest": list(set(all_kinds_in_manifest))
+            }
 
     def _handle_experiment_resource(self, experiment_data: dict): # Переименовано
         exp_name = experiment_data.get("metadata", {}).get("name", "unnamed_experiment")
