@@ -5,7 +5,7 @@
 logging:
   file_level: "DEBUG"  # DEBUG, INFO, WARNING, ERROR, CRITICAL
   console_level: "WARNING"  # DEBUG, INFO, WARNING, ERROR, CRITICAL
-  format: "%(asctime)s %(levelname)s [%(process)d:%(threadName)s] %(funcName)s: %(message)s"
+  format: "%(asctime)s %(levelname)s [%(process)d:%(module)s] %(funcName)s: %(message)s"
   rotation:
     max_bytes: 10*1024*1024 # 10 MB
     backup_count: 32

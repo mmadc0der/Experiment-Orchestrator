@@ -52,6 +52,12 @@ from models.instances import (
 # from .manifest_parser import ManifestParser
 
 class ManifestExpander:
+    # Class-level constants for reference handling
+    REFERENCE_PREFIX = "ref::"
+    PARAM_REF_PATTERN = re.compile(r"^{{\s*parameters\.(?P<name>[a-zA-Z0-9_]+)\s*}}$")
+    JOB_OUTPUT_REF_PATTERN = re.compile(r"^{{\s*job\.outputs\.(?P<name>[a-zA-Z0-9_]+)\s*}}$")
+    STEP_OUTPUT_REF_PATTERN = re.compile(r"^{{\s*(?P<step_name>[a-zA-Z0-9_-]+)\.outputs\.(?P<output_name>[a-zA-Z0-9_]+)\s*}}$")
+
     def __init__(self, raw_manifest_docs: List[Dict[str, Any]]):
         """
         Initializes the ManifestExpander with raw documents parsed from a YAML manifest.
@@ -63,8 +69,20 @@ class ManifestExpander:
         self.raw_docs = raw_manifest_docs
         self.experiment_def: Optional[ExperimentDefinition] = None
         self.task_defs: Dict[str, TaskDefinition] = {}
+        self.override_params: Dict[str, Any] = {} # Added to store override_params
+        self.experiment_instance_id: Optional[str] = None # Added to store experiment_instance_id
+
+        # Initialize Jinja2 environment
+        self.jinja_env = Environment(undefined=jinja2.Undefined)  # Changed from StrictUndefined
 
         self._parse_and_categorize_definitions()
+
+    def _construct_reference(self, context_parts: List[str]) -> str:
+        """
+        Constructs a standardized reference string.
+        Example: ref::experiment_id:task_id:step_name:outputs:output_name
+        """
+        return f"{ManifestExpander.REFERENCE_PREFIX}{':'.join(context_parts)}"
 
     def _generate_instance_id(self, name_from_metadata: str, entity_type_prefix: str = "") -> str:
         """
@@ -130,15 +148,113 @@ class ManifestExpander:
         
         self.experiment_def = found_experiment_defs[0]
 
-        # Initialize resolved_global_params
-        self.resolved_global_params: Dict[str, Any] = {}
-        if self.experiment_def and self.experiment_def.spec.global_parameter_definitions:
-            for gpd in self.experiment_def.spec.global_parameter_definitions:
-                # TODO: Add type validation/casting based on gpd.type if necessary
-                self.resolved_global_params[gpd.name] = gpd.value
-            logger.debug(f"Initialized resolved_global_params: {self.resolved_global_params}")
+        # Initialize resolved_global_params and resolved_global_param_literals
+        # Global params will be resolved in expand_experiment, once experiment_instance_id is known.
 
         # TODO: Добавить валидацию, что все task_reference в ExperimentDefinition существуют в self.task_defs
+
+    def _resolve_global_params(self, experiment_def: ExperimentDefinition) -> None:
+        """Resolves global parameters, handling precedence and storing them as references
+        with their literal values stored separately.
+        Precedence: overrides > experiment_def.parameters (with defaults) > experiment_def.spec.global_parameter_definitions.
+        """
+        if not self.experiment_instance_id:
+            logger.error("_resolve_global_params called before experiment_instance_id is set. Cannot create valid references.")
+            # Raising an error might be better as valid references are critical.
+            temp_exp_id_for_ref = "UNKNOWN_EXPERIMENT_ID" # Fallback, though ideally this state is prevented.
+        else:
+            temp_exp_id_for_ref = self.experiment_instance_id
+
+        # These will hold the final resolved parameters and their literals.
+        resolved_refs: Dict[str, str] = {}
+        resolved_literals: Dict[str, Any] = {}
+
+        # 1. Process experiment_def.spec.global_parameter_definitions (base values)
+        # These are List[GlobalParameterValue] from the manifest's spec section.
+        if experiment_def.spec and experiment_def.spec.global_parameter_definitions:
+            for gpd_val in experiment_def.spec.global_parameter_definitions:
+                param_name = gpd_val.name
+                param_value = gpd_val.value
+                ref_parts = [temp_exp_id_for_ref, "global_params", param_name]
+                param_ref = self._construct_reference(ref_parts)
+
+                if param_name in self.override_params:
+                    value_to_store = self.override_params[param_name]
+                    has_value = True
+                    source_info = "override"
+                elif param_def.default is not None:
+                    value_to_store = param_def.default
+                    has_value = True
+                    source_info = "default from experiment_def.spec.global_parameter_definitions"
+                elif param_name in resolved_literals: # Value already set from spec.global_parameter_definitions
+                    # If 'required' is true here, it's satisfied by the value from spec.
+                    # No need to update value_to_store, keep the one from spec unless overridden.
+                    # This 'elif' ensures we don't raise 'required' error if spec provided it.
+                    pass # Value from spec is already in resolved_literals and will be kept if not overridden
+                elif param_def.required:
+                    raise ValueError(
+                        f"Required global parameter '{param_name}' from experiment_def.spec.global_parameter_definitions "
+                        f"not provided via override, has no default, and not found in spec.global_parameter_definitions."
+                    )
+                
+                if has_value: # If override or default was applied for this parameter definition
+                    logger.debug(f"Global parameter '{param_name}' value set/updated from {source_info}: {value_to_store}")
+                    ref_parts = [temp_exp_id_for_ref, "global_params", param_name]
+                    param_ref = self._construct_reference(ref_parts)
+                    resolved_refs[param_name] = param_ref      # Update/overwrite ref from spec if name collision
+                    resolved_literals[param_name] = value_to_store # Update/overwrite literal from spec
+        
+        # 2. Process experiment_def.spec.parameters (structured definitions with defaults, required flags)
+        # These are Dict[str, GlobalParameterDefinitionModel] from the manifest's parameters section.
+        # These can override or supplement values from spec.global_parameter_definitions.
+        # Overrides from self.override_params take highest precedence here.
+        if hasattr(experiment_def, 'spec') and experiment_def.spec and hasattr(experiment_def.spec, 'parameters') and experiment_def.spec.parameters:
+            for name, definition_model in experiment_def.spec.parameters.items():
+                value_to_store = None
+                has_value = False
+                source_info = ""
+
+                if name in self.override_params:
+                    value_to_store = self.override_params[name]
+                    has_value = True
+                    source_info = "override"
+                elif definition_model.default is not None:
+                    value_to_store = definition_model.default
+                    has_value = True
+                    source_info = "default from experiment_def.spec.parameters"
+                elif name in resolved_literals: # Value already set from spec.global_parameter_definitions
+                    # If 'required' is true here, it's satisfied by the value from spec.
+                    # No need to update value_to_store, keep the one from spec unless overridden.
+                    # This 'elif' ensures we don't raise 'required' error if spec provided it.
+                    pass # Value from spec is already in resolved_literals and will be kept if not overridden
+                elif definition_model.required:
+                    raise ValueError(
+                        f"Required global parameter '{name}' from experiment_def.spec.parameters "
+                        f"not provided via override, has no default, and not found in spec.global_parameter_definitions."
+                    )
+                
+                if has_value: # If override or default was applied for this parameter definition
+                    logger.debug(f"Global parameter '{name}' value set/updated from {source_info}: {value_to_store}")
+                    ref_parts = [temp_exp_id_for_ref, "global_params", name]
+                    param_ref = self._construct_reference(ref_parts)
+                    resolved_refs[name] = param_ref      # Update/overwrite ref from spec if name collision
+                    resolved_literals[name] = value_to_store # Update/overwrite literal from spec
+        
+        # 3. Process any override_params that were not part of experiment_def.parameters
+        # These are considered additional or ad-hoc overrides.
+        for name, value in self.override_params.items():
+            if name not in resolved_refs: # If not already processed via experiment_def.parameters
+                logger.debug(f"Global parameter '{name}' (ad-hoc override) set with value: {value}")
+                ref_parts = [temp_exp_id_for_ref, "global_params", name]
+                param_ref = self._construct_reference(ref_parts)
+                resolved_refs[name] = param_ref
+                resolved_literals[name] = value
+
+        self.resolved_global_params = resolved_refs
+        self.resolved_global_param_literals = resolved_literals
+        
+        logger.info(f"Final resolved global parameters (as references): {self.resolved_global_params}")
+        logger.debug(f"Final global parameter literals: {self.resolved_global_param_literals}")
 
     def process_manifest(self) -> Tuple[ExperimentInstance, List[TaskInstance], List[JobInstance]]:
         """
@@ -169,6 +285,10 @@ class ManifestExpander:
 
         exp_instance_name = self.experiment_def.metadata.get("name", "default-experiment")
         exp_instance_id = self._generate_instance_id(exp_instance_name, "exp")
+        self.experiment_instance_id = exp_instance_id # Set the instance ID for the expander context
+
+        # Resolve global parameters now that we have the experiment_instance_id
+        self._resolve_global_params(self.experiment_def)
         
         experiment_instance = ExperimentInstance(
             id=exp_instance_id,
@@ -263,27 +383,57 @@ class ManifestExpander:
                         else:
                             logger.warning(f"Dependency '{dep_pipeline_task_name}' for pipeline task '{pipeline_task_def.name}' not yet processed or not found. Check pipeline order.")
                 
+                # Теперь final_task_params содержит исходные значения.
+                # Преобразуем их в ссылки и сохраним литералы отдельно.
+                final_task_params_as_refs: Dict[str, str] = {}
+                task_input_literals: Dict[str, Any] = {}
+                exp_id_for_ref = experiment_instance.id # Используем ID уже созданного ExperimentInstance
+
+                for param_key, param_value in final_task_params.items():
+                    # Проверяем, является ли значение простым литералом (str, int, float, bool)
+                    # Сложные структуры (dict, list) пока не оборачиваем в ссылки на этом уровне,
+                    # предполагая, что они будут обработаны внутри _expand_task_into_jobs, если это параметры шагов.
+                    # Если это параметр уровня задачи, который является словарем/списком, его обработка как единого литерала может быть сложной.
+                    # TODO: Продумать обработку сложных структур как литералов на уровне TaskInstance.
+                    if isinstance(param_value, (str, int, float, bool)):
+                        # Если это уже существующая ссылка от global://, не пересоздаем
+                        if isinstance(param_value, str) and param_value.startswith(self.REFERENCE_PREFIX):
+                            final_task_params_as_refs[param_key] = param_value
+                        else:
+                            literal_ref = self._construct_reference([exp_id_for_ref, task_instance_id, "parameters", param_key])
+                            final_task_params_as_refs[param_key] = literal_ref
+                            task_input_literals[param_key] = param_value
+                    else: # Handles complex types (dict, list) and None
+                        # Convert complex types and None to references as well.
+                        # Their actual value will be stored in task_input_literals.
+                        # This ensures TaskInstance.parameters remains Dict[str, str].
+                        logger.debug(f"TaskInstance '{task_instance_name_for_id}' parameter '{param_key}' is a complex type ({type(param_value)}) or None. Converting to reference and storing literal.")
+                        literal_ref = self._construct_reference([exp_id_for_ref, task_instance_id, "parameters", param_key])
+                        final_task_params_as_refs[param_key] = literal_ref
+                        task_input_literals[param_key] = param_value
+
                 task_instance = TaskInstance(
                     id=task_instance_id,
-                    experiment_instance_id=experiment_instance.id,
+                    experiment_instance_id=exp_id_for_ref,
                     task_definition_ref=task_def_name,
-                    name=task_instance_name_for_id, # Уникальное имя экземпляра задачи
-                    name_in_pipeline=pipeline_task_def.name, # Имя задачи как в конвейере эксперимента
-                    parameters=final_task_params, # Разрешенные параметры для этой конкретной задачи
+                    name=task_instance_name_for_id, 
+                    name_in_pipeline=pipeline_task_def.name, 
+                    parameters=final_task_params_as_refs, # Теперь это Dict[str, str] (в идеале)
+                    input_literal_values=task_input_literals,
                     status=InstanceStatus.PENDING,
-                    depends_on_task_ids=depends_on_task_instance_ids,
-                    # inputs/outputs будут разрешаться позже или при выполнении
+                    depends_on_task_ids=depends_on_task_instance_ids
                 )
                 logger.info(f"Created TaskInstance: ID={task_instance.id}, Name='{task_instance.name}'")
                 all_task_instances.append(task_instance)
                 current_task_instance_ids_for_pipeline_task.append(task_instance.id)
 
                 # Для каждого TaskInstance создаем его JobInstances
+                # experiment_params передаются как есть (пока не ссылки), task_call_params теперь ссылки
                 job_instances_for_task = self._expand_task_into_jobs(
                     task_def=task_def,
-                    task_instance=task_instance,
-                    experiment_params=self.resolved_global_params, # Передаем глобальные параметры эксперимента
-                    task_call_params=final_task_params      # Передаем разрешенные параметры задачи
+                    task_instance=task_instance, # task_instance уже содержит параметры как ссылки и литералы
+                    experiment_params=self.resolved_global_params, # Глобальные параметры эксперимента (пока не ссылки)
+                    task_call_params=task_instance.parameters # Это уже Dict[str, str] ссылок
                 )
                 all_job_instances.extend(job_instances_for_task)
             
@@ -291,23 +441,73 @@ class ManifestExpander:
 
         return experiment_instance, all_task_instances, all_job_instances
 
-    def _render_template(self, template_string: str, context: Dict[str, Any]) -> str:
-        """
-        Renders a Jinja2 template string with the given context.
-        """
-        logger.debug(f"Attempting to render template '{template_string}' with context keys: {list(context.keys())}")
-        try:
-            template = jinja2.Template(template_string)
-            rendered_string = template.render(context)
-            logger.debug(f"Successfully rendered template to: '{rendered_string}'")
-            return rendered_string
-        except jinja2.exceptions.UndefinedError as e:
-            undefined_name = getattr(e, 'name', 'Unknown')
-            logger.debug(f"Jinja2 UndefinedError ('{undefined_name}' is undefined) for template: '{template_string}'. Keeping original.")
-            return template_string
-        except Exception as e:
-            logger.error(f"General error rendering template='{template_string}': {e}", exc_info=True)
-            return template_string
+    def _render_template(
+        self,
+        template_string: Any,
+        context: Dict[str, Any],
+        job_instance_context: Optional[JobInstanceContext] = None,
+        task_instance: Optional[TaskInstance] = None,
+        global_param_literals: Optional[Dict[str, Any]] = None,
+        current_job_id: Optional[str] = None, 
+        current_step_name: Optional[str] = None, 
+        is_output_template: bool = False,
+        template_type: str = "parameter"
+    ) -> Tuple[str, Optional[Any]]:
+        if not isinstance(template_string, str):
+            return template_string, None
+
+        if not ("{{" in template_string and "}}" in template_string):
+            return template_string, None
+
+        exp_id = context.get("experiment", {}).get("id", "unknown_exp")
+        task_id = context.get("task", {}).get("id", "unknown_task")
+
+        if is_output_template:
+            match = self.JOB_OUTPUT_REF_PATTERN.match(template_string)
+            if match:
+                output_name = match.group("name")
+                if not current_job_id:
+                    logger.error(f"Cannot construct self-output reference for '{template_string}': current_job_id is missing.")
+                    return template_string, None
+                ref = self._construct_reference([exp_id, task_id, current_job_id, "outputs", output_name])
+                logger.debug(f"Rendered self-output template '{template_string}' to reference: '{ref}' for job {current_job_id}")
+                return ref, None
+
+        match = self.STEP_OUTPUT_REF_PATTERN.match(template_string)
+        if match:
+            referenced_step_name = match.group("step_name")
+            output_name = match.group("output_name")
+            if referenced_step_name in context and isinstance(context[referenced_step_name], dict) and \
+               "outputs" in context[referenced_step_name] and output_name in context[referenced_step_name]["outputs"]:
+                resolved_ref = context[referenced_step_name]["outputs"][output_name]
+                if isinstance(resolved_ref, str) and resolved_ref.startswith(self.REFERENCE_PREFIX):
+                    logger.debug(f"Rendered step output template '{template_string}' to existing reference: '{resolved_ref}'")
+                    return resolved_ref, None
+                else:
+                    logger.warning(
+                        f"Step '{referenced_step_name}' output '{output_name}' found in context for template '{template_string}' "
+                        f"but is not a valid reference: '{resolved_ref}'. This might indicate an issue in how "
+                        f"processed_steps_context is populated.")
+            else:
+                logger.debug(
+                    f"Prospective reference for '{template_string}'. Referenced step '{referenced_step_name}' or its output "
+                    f"'{output_name}' not found as a direct reference in current rendering context. "
+                    f"Context keys for steps: {[k for k in context if isinstance(context[k], dict) and 'outputs' in context[k]]}")
+            ref = self._construct_reference([exp_id, task_id, referenced_step_name, "outputs", output_name])
+            logger.debug(f"Rendered step output template '{template_string}' to prospective reference: '{ref}'")
+            return ref, None
+
+        match = self.PARAM_REF_PATTERN.match(template_string)
+        if match:
+            param_name = match.group("name")
+            ref = self._construct_reference([exp_id, task_id, "parameters", param_name])
+            logger.debug(f"Rendered task parameter template '{template_string}' to reference: '{ref}'")
+            return ref, None
+
+        logger.debug(
+            f"Template '{template_string}' (type: {template_type}) did not match known reference patterns. "
+            f"Returning original string. It will be treated as a literal if not already a ref.")
+        return template_string, None
 
     def _expand_task_into_jobs(
         self,
@@ -322,9 +522,9 @@ class ManifestExpander:
         def _extract_step_dependencies_from_str(template_string: str) -> List[str]:
             if not isinstance(template_string, str):
                 return []
-            # Regex to find {{steps.<step_name>.outputs...}} or {{<step_name>.outputs...}}
+            # Regex to find {{<step_name>.outputs...}}
             # It captures the <step_name>
-            dependencies = re.findall(r"\{\{\s*(?:steps\.)?([a-zA-Z0-9_.-]+)\.outputs\.", template_string)
+            dependencies = re.findall(r"\{\{\s*([a-zA-Z0-9_.-]+)\.outputs\.", template_string)
             return list(set(dependencies))
 
         def _collect_dependencies_recursive(value: Any, collected_deps_set: set):
@@ -351,119 +551,182 @@ class ManifestExpander:
 
             current_job_dependency_names: set[str] = set(step_def.depends_on or [])
 
+            exp_id_for_ref = task_instance.experiment_instance_id
+            task_id_for_ref = task_instance.id
+
+            # Инициализация JobInstanceContext для текущего джоба
+            current_job_instance_context = JobInstanceContext(
+                experiment_id=exp_id_for_ref, # Corrected field name
+                task_instance_id=task_id_for_ref,
+                job_instance_id=job_instance_id,
+                job_definition_ref=job_definition_reference, # Added missing field
+                resolved_parameters={}, # Будет заполнено позже
+                input_literal_values={}, # Будет заполняться по мере разрешения
+                resolved_inputs={}, # Будет заполнено позже
+                resolved_outputs={} # Будет заполнено позже
+            )
+
             # 1. Контекст для рендеринга параметров и входов ТЕКУЩЕГО шага.
-            # Он включает выходы ПРЕДЫДУЩИХ обработанных шагов.
             current_step_render_context = {
-                "parameters": {**(experiment_params or {}), **(task_call_params or {})}, # Global and task-level params
-                "experiment": {"id": task_instance.experiment_instance_id},
-                "task": {"id": task_instance.id, "name": task_instance.name},
-                "job": {"id": job_instance_id}, # ID of the JobInstance being created
-                "steps": processed_steps_context # Outputs of previously processed steps
+                "parameters": {**(experiment_params or {}), **(task_call_params or {})}, 
+                "experiment": {"id": exp_id_for_ref},
+                "task": {"id": task_id_for_ref, "name": task_instance.name},
+                "job": {"id": job_instance_id}, 
+                **processed_steps_context 
             }
 
             # 2. Разрешение параметров текущего шага
-            resolved_current_step_params = {}
+            resolved_current_step_params_as_refs = {}
             if step_def.parameters:
                 for key, value_template in step_def.parameters.items():
                     _collect_dependencies_recursive(value_template, current_job_dependency_names)
-                    # Recursively render templates within complex structures (lists/dicts)
-                    def _render_param_value(template_val):
+                    
+                    # Рекурсивная функция для обработки вложенных структур (списки/словари)
+                    def _process_param_value(template_val, param_key_path: List[str]):
                         if isinstance(template_val, str):
-                            return self._render_template(template_val, current_step_render_context)
+                            # current_job_instance_context из внешней области видимости цикла
+                            # task_instance из аргументов _expand_task_into_jobs
+                            # self.resolved_global_param_literals из атрибутов экземпляра ManifestExpander
+                            ref_str, literal_val = self._render_template(
+                                template_string=template_val, 
+                                context=current_step_render_context, 
+                                job_instance_context=current_job_instance_context,
+                                task_instance=task_instance,
+                                global_param_literals=self.resolved_global_param_literals,
+                                current_job_id=job_instance_id,
+                                current_step_name=step_def.name,
+                                is_output_template=False,
+                                template_type=f"parameter:{'.'.join(param_key_path)}"
+                            )
+                            if literal_val is not None:
+                                # Сохраняем разрешенный литерал в контексте джоба, используя ссылку как ключ
+                                current_job_instance_context.input_literal_values[ref_str] = literal_val
+                            return ref_str # Возвращаем ссылку
                         elif isinstance(template_val, list):
-                            return [_render_param_value(item) for item in template_val]
+                            return [_process_param_value(item, param_key_path + [str(idx)]) for idx, item in enumerate(template_val)]
                         elif isinstance(template_val, dict):
-                            return {k: _render_param_value(v) for k, v in template_val.items()}
-                        return template_val
+                            return {k: _process_param_value(v, param_key_path + [k]) for k, v in template_val.items()}
+                        return template_val # Не строка, не список, не словарь - возвращаем как есть (например, число, bool)
 
-                    resolved_current_step_params[key] = _render_param_value(value_template)
+                    resolved_current_step_params_as_refs[key] = _process_param_value(value_template, [key])
             
-            # Итоговые разрешенные параметры для текущего шага (глобальные + задачные + специфичные для шага)
-            final_resolved_parameters = {
-                **(experiment_params or {}),
-                **(task_call_params or {}),
-                **resolved_current_step_params
+            # Итоговые параметры для JobInstanceContext (только ссылки)
+            # Глобальные и задачные параметры также должны быть представлены как ссылки
+            # Это более сложный момент, так как они приходят уже "разрешенными". 
+            # Пока что для них оставим прямое значение, но в будущем их тоже нужно будет обернуть в ссылки.
+            # TODO: Обернуть experiment_params и task_call_params в ссылки.
+            final_resolved_parameters_as_refs = {
+                **(experiment_params or {}), # ВРЕМЕННО: оставляем как есть
+                **(task_call_params or {}),  # ВРЕМЕННО: оставляем как есть
+                **resolved_current_step_params_as_refs
             }
 
-            # 3. Разрешение ВЫХОДНЫХ ЗНАЧЕНИЙ/ШАБЛОНОВ для текущего шага
-            current_job_produced_outputs: Dict[str, Any] = {}
+            # 3. Рендеринг ВЫХОДНЫХ ЗНАЧЕНИЙ (шаблонов) для текущего шага
+            job_instance_rendered_outputs_as_refs: Dict[str, str] = {}
+            # Контекст для рендеринга выходов текущего джоба.
+            # Важно: параметры здесь должны быть уже в виде ссылок или литералов, которые _render_template сможет обработать.
+            job_self_output_render_context = {
+                "parameters": final_resolved_parameters_as_refs, # Используем параметры в виде ссылок
+                "experiment": {"id": exp_id_for_ref},
+                "task": {"id": task_id_for_ref, "name": task_instance.name},
+                "job": {"id": job_instance_id}
+                # Не включаем сюда processed_steps_context, так как job.outputs ссылается на самого себя
+            }
             if step_def.outputs_templates:
-                # Контекст для рендеринга шаблонов выходных значений текущего шага.
-                # Использует final_resolved_parameters (включая разрешенные параметры текущего шага).
-                # Не должен включать "steps" во избежание циклических ссылок на самого себя.
-                output_value_render_context = {
-                    "parameters": final_resolved_parameters,
-                    "experiment": current_step_render_context["experiment"],
-                    "task": current_step_render_context["task"],
-                    "job": current_step_render_context["job"]
-                }
                 for output_logical_name, output_value_template in step_def.outputs_templates.items():
-                    # Рендерим шаблон выходного значения.
-                    # Это может быть простой тип, строка-шаблон для дальнейшего разрешения, или шаблон URI артефакта.
-                    resolved_value = self._render_template(output_value_template, output_value_render_context)
-                    current_job_produced_outputs[output_logical_name] = resolved_value
-                    # generate_artifact_uri НЕ вызывается здесь по умолчанию.
-                    # Если output_value_template предназначен для генерации URI, он должен сам это сделать
-                    # или быть обернут в специальную функцию в шаблоне, например, {{ artifact_path(...) }})
+                    ref_str, literal_val = self._render_template(
+                        template_string=output_value_template, 
+                        context=job_self_output_render_context, 
+                        job_instance_context=current_job_instance_context,
+                        task_instance=task_instance,
+                        global_param_literals=self.resolved_global_param_literals,
+                        current_job_id=job_instance_id,
+                        current_step_name=step_def.name,
+                        is_output_template=True, # Ключевой флаг
+                        template_type=f"output:{output_logical_name}"
+                    )
+                    job_instance_rendered_outputs_as_refs[output_logical_name] = ref_str
+                    if literal_val is not None:
+                        # Сохраняем "литеральный" выход (если такое возможно) в input_literal_values
+                        # или, возможно, в current_job_instance_context.resolved_outputs если бы оно принимало Any
+                        current_job_instance_context.input_literal_values[ref_str] = literal_val 
+                        logger.debug(f"Output template '{output_value_template}' for output '{output_logical_name}' in step '{step_def.name}' resolved to reference '{ref_str}' with literal value '{literal_val}'.")
+                    
+                    if not ref_str.startswith(self.REFERENCE_PREFIX):
+                        logger.error(f"Output template '{output_value_template}' for output '{output_logical_name}' in step '{step_def.name}' did not resolve to a reference string. Got: '{ref_str}'. This is an issue.")
             
             # Обновляем общий контекст выходных данных шагов задачи (для следующих шагов)
-            processed_steps_context[step_def.name] = {"outputs": current_job_produced_outputs}
+            # Также обновляем resolved_outputs в текущем JobInstanceContext
+            processed_steps_context[step_def.name] = {"outputs": job_instance_rendered_outputs_as_refs}
+            current_job_instance_context.resolved_outputs = job_instance_rendered_outputs_as_refs.copy()
 
             # 4. Разрешение ВХОДНЫХ артефактов
             current_step_resolved_inputs: Dict[str, str] = {}
-            # logger.debug(f"For step '{step_def.name}', step_def.inputs is: {step_def.inputs}")
             if step_def.inputs:
-                # Контекст для рендеринга входов (current_step_render_context) уже определен
-                # и содержит "steps": processed_steps_context (выходы предыдущих шагов)
-                pass # Используем current_step_render_context
                 for input_logical_name, input_uri_template in step_def.inputs.items():
                     _collect_dependencies_recursive(input_uri_template, current_job_dependency_names)
-                    try:
-                        resolved_input_uri = self._render_template(input_uri_template, current_step_render_context)
-                        current_step_resolved_inputs[input_logical_name] = resolved_input_uri
-                    except jinja2.exceptions.UndefinedError as e:
-                        logger.warning(f"Input template '{input_uri_template}' for '{input_logical_name}' in step '{step_def.name}' contains undefined variables (likely a future dependency): {e}. Keeping original template.")
-                        current_step_resolved_inputs[input_logical_name] = input_uri_template
-                    except Exception as e:
-                        logger.error(f"Error rendering input template '{input_uri_template}' for '{input_logical_name}' in step '{step_def.name}': {e}. Keeping original template.", exc_info=True)
-                        current_step_resolved_inputs[input_logical_name] = input_uri_template
+                    ref_str, literal_val = self._render_template(
+                        template_string=input_uri_template, 
+                        context=current_step_render_context, 
+                        job_instance_context=current_job_instance_context,
+                        task_instance=task_instance,
+                        global_param_literals=self.resolved_global_param_literals,
+                        current_job_id=job_instance_id,
+                        current_step_name=step_def.name,
+                        is_output_template=False,
+                        template_type=f"input:{input_logical_name}"
+                    )
+                    current_step_resolved_inputs[input_logical_name] = ref_str
+                    if literal_val is not None:
+                        current_job_instance_context.input_literal_values[ref_str] = literal_val
+                        logger.debug(f"Input template '{input_uri_template}' for input '{input_logical_name}' in step '{step_def.name}' resolved to reference '{ref_str}' with literal value '{literal_val}'.")
+                    
+                    if not ref_str.startswith(self.REFERENCE_PREFIX):
+                        logger.warning(f"Input template '{input_uri_template}' for input '{input_logical_name}' in step '{step_def.name}' resolved to a non-reference string: '{ref_str}'. This might be intended (literal URI) or an issue if a reference to another step's output was expected.")
 
-            # Блоки для JobInstanceContext и старой логики depends_on_job_ids_list удалены,
-            # так как новый JobInstance (ниже) напрямую использует необходимые поля
-            # и depends_on_job_ids вычисляются из current_job_dependency_names.
+            # Заполняем оставшиеся поля в current_job_instance_context
+            current_job_instance_context.resolved_parameters = {
+                **(experiment_params or {}), 
+                **(task_call_params or {}),  
+                **resolved_current_step_params_as_refs
+            }
+            current_job_instance_context.resources_request = getattr(step_def, 'resources', None) or {}
+            current_job_instance_context.priority = getattr(step_def, 'priority', 0)
+            current_job_instance_context.resolved_inputs = current_step_resolved_inputs
+            # current_job_instance_context.resolved_outputs уже был заполнен ранее
+            # current_job_instance_context.input_literal_values наполнялся по ходу дела
 
             # 7. Создание JobInstance
             actual_job_dependency_ids = [
                 step_name_to_job_id_map[dep_name]
                 for dep_name in current_job_dependency_names
-                if dep_name in step_name_to_job_id_map
+                if dep_name in step_name_to_job_id_map # Убедимся, что зависимость существует
             ]
-            # Log if a declared dependency was not found (e.g., typo or future step not yet processed - though loop order should prevent latter)
-            for dep_name in current_job_dependency_names:
-                if dep_name not in step_name_to_job_id_map:
-                    logger.warning(f"Step '{step_def.name}' has an unresolved dependency on step '{dep_name}'. It might be a typo or a step defined later in the task which is not supported for direct dependency resolution during expansion.")
 
             job_instance = JobInstance(
                 id=job_instance_id,
                 name=job_instance_display_name,
-                task_instance_id=task_instance.id,
-                experiment_instance_id=task_instance.experiment_instance_id,
+                task_instance_id=task_id_for_ref,
                 job_definition_ref=job_definition_reference,
-                parameters=final_resolved_parameters,
-                inputs=current_step_resolved_inputs,
-                resolved_outputs=current_job_produced_outputs, # Outputs resolved at expansion time
-                depends_on_job_ids=list(set(actual_job_dependency_ids)), # Actual JobInstance IDs
-                status=InstanceStatus.PENDING
-                # 'outputs' field in JobInstance might be used for artifact URIs generated at runtime by worker
+                status=InstanceStatus.PENDING, 
+                depends_on_job_ids=actual_job_dependency_ids,
+                command_template=step_def.command if hasattr(step_def, 'command') else None, 
+                image=step_def.image if hasattr(step_def, 'image') else None,
+                node_selector=step_def.node_selector if hasattr(step_def, 'node_selector') else None,
+                retry_policy=step_def.retry_policy if hasattr(step_def, 'retry_policy') else None,
+                timeout_seconds=step_def.timeout_seconds if hasattr(step_def, 'timeout_seconds') else None,
+                environment_variables=step_def.environment_variables if hasattr(step_def, 'environment_variables') else None,
+                context=current_job_instance_context,
+                resolved_outputs=job_instance_rendered_outputs_as_refs
             )
             job_instances_for_task.append(job_instance)
-            step_name_to_job_id_map[step_def.name] = job_instance.id
+            step_name_to_job_id_map[step_def.name] = job_instance_id
 
         return job_instances_for_task # Добавлен return
 
 if __name__ == '__main__':
     from logger import init_logging
-    init_logging() # Initialize custom logging
+    init_logging(console_level=logging.INFO) # Initialize custom logging, set console to INFO
     logger.info("ManifestExpander basic test")
 
     # Test logging levels were here and removed, which is correct.
@@ -482,11 +745,13 @@ if __name__ == '__main__':
                         "parameters": { # Базовые параметры для этой задачи
                             "base_param": "value_for_all_iterations"
                         },
-                        "iterateOver": { # <--- ДОБАВЛЯЕМ ITERATE_OVER
-                            "learning_rate": [0.01, 0.001],
-                            "optimizer": ["adam", "sgd"],
-                            "version_suffix": ["iter1", "iter2"] # Добавляем итерацию по version_suffix
-                        }
+                        "iterateOver": [{
+                            "parameters": { # <--- Параметры итерации теперь вложены сюда
+                                "learning_rate": [0.01, 0.001],
+                                "optimizer": ["adam", "sgd"],
+                                "version_suffix": ["iter1", "iter2"] # Добавляем итерацию по version_suffix
+                            }
+                        }]
                     },
                     # Можно добавить еще одну задачу, которая зависит от первой,
                     # чтобы потом протестировать depends_on
@@ -577,12 +842,12 @@ if __name__ == '__main__':
             for ji in job_instances:
                 logger.info(f"  JobInstance Created: ID={ji.id}, Name='{ji.name}'") # INFO for creation
                 logger.debug(f"    TaskInstance ID: {ji.task_instance_id}")
-                logger.debug(f"    Context Job Def Ref: {ji.context.job_definition_ref}")
-                logger.debug(f"    Context Resolved Params: {ji.context.resolved_parameters}")
-                logger.debug(f"    Context Resolved Inputs: {ji.context.resolved_inputs}")
-                logger.debug(f"    Context Resolved Outputs: {ji.context.resolved_outputs}")
-                logger.debug(f"    Context Resources: {ji.context.resources_request}")
-                logger.debug(f"    Context Priority: {ji.context.priority}")
+                logger.debug(f"    Job Definition Ref: {ji.job_definition_ref}")
+                logger.debug(f"    Resolved Parameters: {ji.context.resolved_parameters}")
+                logger.debug(f"    Resolved Inputs: {ji.context.resolved_inputs}")
+                logger.debug(f"    Resolved Outputs (at expansion): {ji.resolved_outputs}") # This is the direct field on JobInstance with actual values
+                logger.debug(f"    Resources: {ji.context.resources_request}")
+                logger.debug(f"    Priority: {ji.context.priority}")
                 logger.debug(f"    Depends on Job IDs: {ji.depends_on_job_ids}")
                 logger.debug(f"    Created At: {ji.created_at}")
                 

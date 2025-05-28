@@ -44,7 +44,7 @@ def init_logging(file_level=logging.INFO, console_level=logging.WARNING, log_dir
     # File Handler (INFO+), rotation by size, up to 5 archives
     log_dir = Path(__file__).parent / log_dir
     log_dir.mkdir(exist_ok=True)
-    log_file_base = log_dir / f"{log_file_name}_{datetime.now().strftime('%Y-%m-%d')}.log"
+    log_file_base = log_dir / f"{log_file_name}_{datetime.now().strftime('%Y-%m')}.log"
     file_handler = CustomRotatingFileHandler(
         str(log_file_base),
         maxBytes=max_bytes,

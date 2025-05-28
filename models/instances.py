@@ -40,7 +40,8 @@ class JobInstanceContext(BaseModel):
     job_instance_id: str = Field(..., description="ID of this JobInstance")
     
     job_definition_ref: str = Field(..., description="Reference to the definition of this job, e.g., 'my_jobs_package.train_model_job' or a TaskDefinition name")
-    resolved_parameters: Dict[str, Any] = Field(default_factory=dict, description="Resolved parameters for this job instance, e.g., {'lr': 0.001}")
+    resolved_parameters: Optional[Dict[str, str]] = Field(default_factory=dict, description="Resolved parameters for the job execution, as references (ref::...). Actual literal values are in input_literal_values.")
+    input_literal_values: Optional[Dict[str, Any]] = Field(default_factory=dict, description="Actual literal values for input parameters, keyed by parameter name.")
     resolved_inputs: Optional[Dict[str, str]] = Field(default=None, description="Resolved input artifact URIs, e.g., {'raw_data': 'artifact://exp-1/job-prev/data.csv'}")
     resolved_outputs: Optional[Dict[str, str]] = Field(default=None, description="Resolved output artifact URIs, e.g., {'trained_model': 'artifact://exp-1/job-this/model.pt'}")
     resources_request: Dict[str, Any] = Field(default_factory=dict, description="Resource requirements, e.g., {'gpus': 1, 'cpus': 2, 'memory_gb': 4}")
@@ -58,6 +59,7 @@ class JobInstance(BaseModel):
     status: InstanceStatus = Field(default=InstanceStatus.PENDING)
     context: JobInstanceContext
     depends_on_job_ids: List[str] = Field(default_factory=list, description="List of JobInstance IDs this job depends on")
+    resolved_outputs: Optional[Dict[str, Any]] = Field(default_factory=dict, description="Outputs resolved at expansion time, containing actual values (not just URIs)")
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     queued_at: Optional[datetime] = None
@@ -78,8 +80,9 @@ class TaskInstance(BaseModel):
     name_in_pipeline: str = Field(..., description="Name of the task as defined in the experiment pipeline, e.g., 'data-prep'")
     experiment_instance_id: str
     task_definition_ref: str = Field(..., description="Reference to the TaskDefinition from the manifest")
+    parameters: Optional[Dict[str, str]] = Field(default_factory=dict, description="Resolved parameters for this task instance, as references (ref::...). Actual literal values are in input_literal_values.")
+    input_literal_values: Optional[Dict[str, Any]] = Field(default_factory=dict, description="Actual literal values for task-level input parameters, keyed by parameter name.")
     status: InstanceStatus = Field(default=InstanceStatus.PENDING)
-    parameters: Dict[str, Any] = Field(default_factory=dict) # Resolved parameters for this instance
     job_instance_ids: List[str] = Field(default_factory=list)
     depends_on_task_ids: List[str] = Field(default_factory=list, description="List of TaskInstance IDs this task instance depends on")
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
