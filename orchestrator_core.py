@@ -12,7 +12,7 @@ logger = custom_logging.getLogger(__name__)
 from manifest_processing.manifest_parser import ManifestParser
 from manifest_processing.manifest_expander import ManifestExpander
 
-CONFIG_FILE_NAME = "config.example.yaml"
+CONFIG_FILE_NAME = "config.yaml"
 DEFAULT_LOG_FORMAT = "%(asctime)s %(levelname)s [%(process)d:%(threadName)s] %(funcName)s: %(message)s"
 API_VERSION = "v1alpha2"
 

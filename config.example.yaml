@@ -16,3 +16,11 @@ paths:
   runtime_root: "runtime"       # Root directory for storing runtime data
   log_dir: "log"                # Directory for log files (as used by logger.py)
 
+# Redis configuration for runtime data and job queues
+redis:
+  host: "localhost"
+  port: 6379
+  db: 0
+  username: "default"  # Or your specific username, use null or omit if not using ACLs with username
+  password: "your_redis_password" # Use null or omit if no password
+  key_prefix_user: "user@" # Prefix for all keys, e.g., 'user@' or 'my_app_user@'
