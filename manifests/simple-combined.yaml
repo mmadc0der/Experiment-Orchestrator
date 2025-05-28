@@ -1,0 +1,28 @@
+apiVersion: orchestrator.windsurf.ai/v1alpha1 # Версия схемы ресурса
+kind: Task # TaskDefinition
+metadata:
+  name: simple-task-v1
+spec:
+  description: A simple task that prints a message.
+  parametersSchema:
+    message:
+      type: string
+      description: The message to print.
+  steps:
+  - name: print-message-step
+    executor: simple_printer.SimplePrinter # Пример исполнителя
+    parameters:
+      text_to_print: "{{parameters.message}}"
+    outputs_templates: {} # Нет артефактов на выходе для этого простого примера
+---
+apiVersion: orchestrator.windsurf.ai/v1alpha1 # Версия схемы ресурса
+kind: Experiment
+metadata:
+  name: simple-test-experiment
+spec:
+  description: A very simple experiment with one task.
+  pipeline:
+  - name: first-simple-task
+    taskReference: simple-task-v1
+    parameters:
+      message: "Hello from simple experiment!"

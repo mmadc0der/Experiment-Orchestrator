@@ -1,16 +1,46 @@
 apiVersion: orchestrator.windsurf.ai/v1alpha1
-kind: Model
+kind: Task
 metadata:
-  name: resnet18-cifar10
-  labels:
-    architecture: "resnet"
-    task_type: "image-classification"
+  name: sum-task-v1
 spec:
-  description: "ResNet-18 model adapted for CIFAR-10 classification."
-  sourceType: "module"  
-  
-  modulePath: "torchvision.models.resnet18"
+  description: "A simple task that sums two numbers."
+  parametersSchema:
+    a:
+      type: integer
+      description: First number to sum.
+    b:
+      type: integer
+      description: Second number to sum.
+    c:
+      type: integer
+      description: Third number to sum.
+  steps:
+  - name: sum-1
+    executor: modules.jobs.sum_job.SumJob
+    parameters:
+      a: "{{parameters.a}}"
+      b: "{{parameters.b}}"
+    outputs_templates: 
+      result: "{{job.outputs.result}}"
+  - name: sum-2
+    executor: modules.jobs.sum_job.SumJob
+    parameters:
+      a: "{{sum-1.outputs.result}}"
+      b: "{{parameters.c}}"
+    outputs_templates: 
+      result: "{{job.outputs.result}}"
+---
 
-  config:
-    pretrained: false 
-    num_classes: 10 
+apiVersion: orchestrator.windsurf.ai/v1alpha1
+kind: Experiment
+metadata:
+  name: simple-test-experiment
+spec:
+  description: A very simple experiment with one task.
+  pipeline:
+  - name: first-simple-task
+    taskReference: sum-task-v1
+    parameters:
+      a: 1
+      b: 2
+      c: 3

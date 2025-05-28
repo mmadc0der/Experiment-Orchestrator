@@ -91,13 +91,17 @@ class TaskDefinition(BaseModel):
 
 # --- Experiment Definition ---
 
+class IterateItem(BaseModel):
+    parameters: Dict[str, Any] = Field(..., description="A set of parameters for a single iteration.")
+    # Можно добавить сюда name или id для итерации, если потребуется в будущем
+
 class ExperimentPipelineTask(BaseModel):
     name: str = Field(..., description="Unique name for this task invocation within the experiment's pipeline")
     task_reference: str = Field(..., alias="taskReference", description="Name of the TaskDefinition to execute")
     parameters: Optional[Dict[str, Any]] = Field(default_factory=dict, description="Specific parameter values for this TaskDefinition invocation. Can use templating from experiment parameters.")
     inputs: Optional[Dict[str, str]] = Field(default_factory=dict, description="Mapping of TaskDefinition's input artifact names to experiment-level artifacts or outputs of previous pipeline tasks (e.g., 'artifact_uri' or '{{tasks.prev_task_name.outputs.artifact_name}}')")
     depends_on: Optional[List[str]] = Field(default_factory=list, alias="dependsOn", description="List of other ExperimentPipelineTask names within the same experiment that this task depends on")
-    iterate_over: Optional[Dict[str, List[Any]]] = Field(default=None, alias="iterateOver", description="Parameter grid for iterating this task, creating multiple TaskInstances. E.g., {'learning_rate': [0.01, 0.001]}")
+    iterate_over: Optional[List[IterateItem]] = Field(default=None, alias="iterateOver", description="List of parameter sets for iterating this task. Each item in the list generates one TaskInstance with the specified parameters.")
     # on_condition: Optional[str] = Field(None, description="A condition string to evaluate for executing this pipeline task")
 
     model_config = {
@@ -105,9 +109,19 @@ class ExperimentPipelineTask(BaseModel):
         "extra": "forbid"
     }
 
+class GlobalParameterDefinition(BaseModel):
+    name: str = Field(..., description="Unique name of the global parameter.")
+    type: str = Field(..., description="Data type of the parameter (e.g., string, integer, float, boolean).") # TODO: Consider using Literal for type
+    value: Any = Field(..., description="Actual value of the global parameter.")
+    description: Optional[str] = Field(default=None, description="Optional description for the global parameter.")
+
+    model_config = {
+        "extra": "forbid"
+    }
+
 class ExperimentSpecification(BaseModel):
     description: Optional[str] = None
-    parameters_schema: Optional[Dict[str, ParameterDefinition]] = Field(default_factory=dict, alias="parametersSchema", description="Global parameters schema for the experiment")
+    global_parameter_definitions: Optional[List[GlobalParameterDefinition]] = Field(default_factory=list, alias="globalParameters", description="List of global parameter definitions for the experiment.")
     pipeline: List[ExperimentPipelineTask] = Field(..., description="The DAG of tasks to be executed in this experiment")
     reporting: Optional[Dict[str, Any]] = Field(default_factory=dict, description="Configuration for experiment reporting")
     # artifact_store_config: Optional[Dict[str, Any]] = Field(None, description="Configuration for the artifact store specific to this experiment")

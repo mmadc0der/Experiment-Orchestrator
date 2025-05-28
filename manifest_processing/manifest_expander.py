@@ -1,6 +1,7 @@
 import itertools
 import uuid
 import logging
+import re
 from datetime import datetime, timezone
 from typing import Dict, List, Any, Optional, Tuple, Union
 import jinja2
@@ -129,6 +130,14 @@ class ManifestExpander:
         
         self.experiment_def = found_experiment_defs[0]
 
+        # Initialize resolved_global_params
+        self.resolved_global_params: Dict[str, Any] = {}
+        if self.experiment_def and self.experiment_def.spec.global_parameter_definitions:
+            for gpd in self.experiment_def.spec.global_parameter_definitions:
+                # TODO: Add type validation/casting based on gpd.type if necessary
+                self.resolved_global_params[gpd.name] = gpd.value
+            logger.debug(f"Initialized resolved_global_params: {self.resolved_global_params}")
+
         # TODO: Добавить валидацию, что все task_reference в ExperimentDefinition существуют в self.task_defs
 
     def process_manifest(self) -> Tuple[ExperimentInstance, List[TaskInstance], List[JobInstance]]:
@@ -166,7 +175,7 @@ class ManifestExpander:
             experiment_definition_ref=self.experiment_def.metadata.get("name"),
             name=exp_instance_name,
             description=self.experiment_def.spec.description,
-            parameters=self.experiment_def.spec.parameters_schema or {}, # TODO: Разрешить параметры эксперимента
+            parameters=self.resolved_global_params or {},
             status=InstanceStatus.PENDING,
         )
         logger.info(f"Created ExperimentInstance: ID={experiment_instance.id}, Name='{experiment_instance.name}'")
@@ -189,27 +198,51 @@ class ManifestExpander:
             # Параметры, переданные при вызове задачи в конвейере эксперимента
             task_call_params = pipeline_task_def.parameters or {}
             
-            # Параметры самого эксперимента (глобальные)
-            # TODO: Разрешить глобальные параметры эксперимента, если они есть
-            experiment_global_params = {} # Placeholder
+            # Глобальные параметры уже разрешены и хранятся в self.resolved_global_params
+            # Этот блок больше не нужен в таком виде, но оставим комментарий как напоминание о контексте
 
             iteration_parameter_sets = []
             if pipeline_task_def.iterate_over:
-                param_names = list(pipeline_task_def.iterate_over.keys())
-                param_value_lists = [pipeline_task_def.iterate_over[name] for name in param_names]
-                
-                for combination_values in itertools.product(*param_value_lists):
-                    iteration_params = dict(zip(param_names, combination_values))
-                    iteration_parameter_sets.append(iteration_params)
-            else:
-                # Если нет iterate_over, будет одна "итерация" с пустым набором итерационных параметров
+                # Новый код для обработки List[IterateItem]
+                for iterate_item_model in pipeline_task_def.iterate_over:
+                    iteration_parameter_sets.append(iterate_item_model.parameters)
+            
+            # Если iterate_over пуст или его не было, добавляем один пустой набор параметров,
+            # чтобы цикл for i, iter_params in enumerate(iteration_parameter_sets) ниже
+            # выполнился хотя бы один раз (для задач без итерации).
+            if not iteration_parameter_sets:
                 iteration_parameter_sets.append({})
 
             current_task_instance_ids_for_pipeline_task: List[str] = []
 
             for i, iter_params in enumerate(iteration_parameter_sets):
-                # Объединяем параметры: итерационные имеют приоритет над параметрами вызова задачи
-                final_task_params = {**task_call_params, **iter_params}
+                # 1. Параметры, определенные в самом pipeline.task (если есть)
+                base_pipeline_task_params = dict(pipeline_task_def.parameters or {})
+                
+                # 2. Объединяем с параметрами текущей итерации (iter_params имеют приоритет)
+                current_merged_params = {**base_pipeline_task_params, **iter_params}
+
+                # 3. Разрешаем ссылки global:// и формируем final_task_params
+                final_task_params = {}
+                for key, value in current_merged_params.items():
+                    if isinstance(value, str) and value.startswith("global://"):
+                        global_param_name = value[len("global://"):]
+                        if global_param_name in self.resolved_global_params:
+                            final_task_params[key] = self.resolved_global_params[global_param_name]
+                            logger.debug(f"TaskInstance '{pipeline_task_def.name}-iter{i}': Resolved global param reference '{key}: {value}' to '{final_task_params[key]}'")
+                        else:
+                            logger.warning(f"TaskInstance '{pipeline_task_def.name}-iter{i}': Global parameter reference '{value}' for parameter '{key}' not found. Using string as value.")
+                            final_task_params[key] = value # Оставляем как есть или можно вызвать ошибку
+                    else:
+                        final_task_params[key] = value
+                
+                # Добавляем глобальные параметры, которые не были переопределены на уровне задачи или итерации
+                # Это обеспечивает, что все глобальные параметры доступны, если не указаны локально.
+                for gp_name, gp_value in self.resolved_global_params.items():
+                    if gp_name not in final_task_params:
+                        final_task_params[gp_name] = gp_value
+                        logger.debug(f"TaskInstance '{pipeline_task_def.name}-iter{i}': Added unreferenced global param '{gp_name}: {gp_value}'")
+
 
                 # Имя для TaskInstance: если есть итерация, добавляем суффикс
                 task_instance_base_name = f"{exp_instance_name}-{pipeline_task_def.name}"
@@ -249,7 +282,7 @@ class ManifestExpander:
                 job_instances_for_task = self._expand_task_into_jobs(
                     task_def=task_def,
                     task_instance=task_instance,
-                    experiment_params=experiment_global_params, # Передаем глобальные параметры эксперимента
+                    experiment_params=self.resolved_global_params, # Передаем глобальные параметры эксперимента
                     task_call_params=final_task_params      # Передаем разрешенные параметры задачи
                 )
                 all_job_instances.extend(job_instances_for_task)
@@ -283,130 +316,148 @@ class ManifestExpander:
         experiment_params: Optional[Dict[str, Any]],
         task_call_params: Optional[Dict[str, Any]],
     ) -> List[JobInstance]:
+
+        # Helper functions to extract dependencies from template strings
+        # Defined here for atomicity of the change, ideally would be private class methods
+        def _extract_step_dependencies_from_str(template_string: str) -> List[str]:
+            if not isinstance(template_string, str):
+                return []
+            # Regex to find {{steps.<step_name>.outputs...}} or {{<step_name>.outputs...}}
+            # It captures the <step_name>
+            dependencies = re.findall(r"\{\{\s*(?:steps\.)?([a-zA-Z0-9_.-]+)\.outputs\.", template_string)
+            return list(set(dependencies))
+
+        def _collect_dependencies_recursive(value: Any, collected_deps_set: set):
+            if isinstance(value, str):
+                for dep_name in _extract_step_dependencies_from_str(value):
+                    collected_deps_set.add(dep_name)
+            elif isinstance(value, list):
+                for item in value:
+                    _collect_dependencies_recursive(item, collected_deps_set)
+            elif isinstance(value, dict):
+                for sub_value in value.values():
+                    _collect_dependencies_recursive(sub_value, collected_deps_set)
         
         job_instances_for_task: List[JobInstance] = []
-        
-        job_name_to_id_map: Dict[str, str] = {} # Карта для ID джобов по имени шага
-        current_task_instance_step_outputs: Dict[str, Dict[str, str]] = {} # Карта выходов шагов
+        step_name_to_job_id_map: Dict[str, str] = {} # Maps step_def.name to JobInstance.id
+        # This context will store resolved output values (or templates if not fully resolvable now)
+        # Structure: {"step_name": {"outputs": {"output_key": value}}}
+        processed_steps_context: Dict[str, Dict[str, Any]] = {}
 
         for step_def in task_def.spec.steps:
             job_instance_id = f"job-{uuid.uuid4().hex[:16]}" 
             job_instance_display_name = f"{task_instance.name}-{step_def.name}-{job_instance_id[-8:]}"
             job_definition_reference = f"{task_def.metadata['name']}:{step_def.name}"
 
-            # 1. Базовый контекст для рендеринга
-            base_render_context = {
-                "parameters": {**(experiment_params or {}), **(task_call_params or {})},
+            current_job_dependency_names: set[str] = set(step_def.depends_on or [])
+
+            # 1. Контекст для рендеринга параметров и входов ТЕКУЩЕГО шага.
+            # Он включает выходы ПРЕДЫДУЩИХ обработанных шагов.
+            current_step_render_context = {
+                "parameters": {**(experiment_params or {}), **(task_call_params or {})}, # Global and task-level params
                 "experiment": {"id": task_instance.experiment_instance_id},
                 "task": {"id": task_instance.id, "name": task_instance.name},
-                "job": {"id": job_instance_id}
+                "job": {"id": job_instance_id}, # ID of the JobInstance being created
+                "steps": processed_steps_context # Outputs of previously processed steps
             }
 
-            # 2. Разрешение параметров шага
-            resolved_step_params = {}
+            # 2. Разрешение параметров текущего шага
+            resolved_current_step_params = {}
             if step_def.parameters:
                 for key, value_template in step_def.parameters.items():
-                    if isinstance(value_template, str):
-                        resolved_step_params[key] = self._render_template(value_template, base_render_context)
-                    elif isinstance(value_template, list):
-                        resolved_step_params[key] = [
-                            self._render_template(item, base_render_context) if isinstance(item, str) else item
-                            for item in value_template
-                        ]
-                    else:
-                        resolved_step_params[key] = value_template
+                    _collect_dependencies_recursive(value_template, current_job_dependency_names)
+                    # Recursively render templates within complex structures (lists/dicts)
+                    def _render_param_value(template_val):
+                        if isinstance(template_val, str):
+                            return self._render_template(template_val, current_step_render_context)
+                        elif isinstance(template_val, list):
+                            return [_render_param_value(item) for item in template_val]
+                        elif isinstance(template_val, dict):
+                            return {k: _render_param_value(v) for k, v in template_val.items()}
+                        return template_val
+
+                    resolved_current_step_params[key] = _render_param_value(value_template)
             
-            # Итоговые разрешенные параметры (эксперимент + задача/итерация + шаг)
+            # Итоговые разрешенные параметры для текущего шага (глобальные + задачные + специфичные для шага)
             final_resolved_parameters = {
                 **(experiment_params or {}),
-                **(task_call_params or {}), 
-                **resolved_step_params      
+                **(task_call_params or {}),
+                **resolved_current_step_params
             }
 
-            # 3. Разрешение ВЫХОДНЫХ артефактов
-            current_step_resolved_outputs: Dict[str, str] = {}
+            # 3. Разрешение ВЫХОДНЫХ ЗНАЧЕНИЙ/ШАБЛОНОВ для текущего шага
+            current_job_produced_outputs: Dict[str, Any] = {}
             if step_def.outputs_templates:
-                output_render_context = {
-                    "parameters": final_resolved_parameters, 
-                    "experiment": base_render_context["experiment"],
-                    "task": base_render_context["task"],
-                    "job": base_render_context["job"]
-                    # "steps" не нужен для имен выходных файлов
+                # Контекст для рендеринга шаблонов выходных значений текущего шага.
+                # Использует final_resolved_parameters (включая разрешенные параметры текущего шага).
+                # Не должен включать "steps" во избежание циклических ссылок на самого себя.
+                output_value_render_context = {
+                    "parameters": final_resolved_parameters,
+                    "experiment": current_step_render_context["experiment"],
+                    "task": current_step_render_context["task"],
+                    "job": current_step_render_context["job"]
                 }
-                for output_logical_name, output_filename_template in step_def.outputs_templates.items():
-                    rendered_output_filename = self._render_template(output_filename_template, output_render_context)
-                    current_step_resolved_outputs[output_logical_name] = generate_artifact_uri(
-                        experiment_id=task_instance.experiment_instance_id,
-                        task_instance_id=task_instance.id,
-                        job_instance_id=job_instance_id,
-                        output_name_template=rendered_output_filename 
-                    )
+                for output_logical_name, output_value_template in step_def.outputs_templates.items():
+                    # Рендерим шаблон выходного значения.
+                    # Это может быть простой тип, строка-шаблон для дальнейшего разрешения, или шаблон URI артефакта.
+                    resolved_value = self._render_template(output_value_template, output_value_render_context)
+                    current_job_produced_outputs[output_logical_name] = resolved_value
+                    # generate_artifact_uri НЕ вызывается здесь по умолчанию.
+                    # Если output_value_template предназначен для генерации URI, он должен сам это сделать
+                    # или быть обернут в специальную функцию в шаблоне, например, {{ artifact_path(...) }})
             
-            # Сохраняем выходы текущего шага для использования следующими шагами
-            if current_step_resolved_outputs:
-                 current_task_instance_step_outputs[step_def.name] = {
-                     "outputs": current_step_resolved_outputs
-                 }
+            # Обновляем общий контекст выходных данных шагов задачи (для следующих шагов)
+            processed_steps_context[step_def.name] = {"outputs": current_job_produced_outputs}
 
             # 4. Разрешение ВХОДНЫХ артефактов
             current_step_resolved_inputs: Dict[str, str] = {}
             # logger.debug(f"For step '{step_def.name}', step_def.inputs is: {step_def.inputs}")
             if step_def.inputs:
-                input_render_context = {
-                    "parameters": final_resolved_parameters,
-                    "experiment": base_render_context["experiment"],
-                    "task": base_render_context["task"],
-                    "job": base_render_context["job"],
-                    "steps": current_task_instance_step_outputs
-                }
+                # Контекст для рендеринга входов (current_step_render_context) уже определен
+                # и содержит "steps": processed_steps_context (выходы предыдущих шагов)
+                pass # Используем current_step_render_context
                 for input_logical_name, input_uri_template in step_def.inputs.items():
-                    # logger.debug(f"Processing input '{input_logical_name}' with template '{input_uri_template}' for step '{step_def.name}'")
+                    _collect_dependencies_recursive(input_uri_template, current_job_dependency_names)
                     try:
-                        resolved_input_uri = self._render_template(input_uri_template, input_render_context)
+                        resolved_input_uri = self._render_template(input_uri_template, current_step_render_context)
                         current_step_resolved_inputs[input_logical_name] = resolved_input_uri
+                    except jinja2.exceptions.UndefinedError as e:
+                        logger.warning(f"Input template '{input_uri_template}' for '{input_logical_name}' in step '{step_def.name}' contains undefined variables (likely a future dependency): {e}. Keeping original template.")
+                        current_step_resolved_inputs[input_logical_name] = input_uri_template
                     except Exception as e:
-                        logger.error(f"Error rendering input '{input_logical_name}' with template '{input_uri_template}' for step '{step_def.name}': {e}. Keeping original template.", exc_info=True)
-                        current_step_resolved_inputs[input_logical_name] = input_uri_template 
+                        logger.error(f"Error rendering input template '{input_uri_template}' for '{input_logical_name}' in step '{step_def.name}': {e}. Keeping original template.", exc_info=True)
+                        current_step_resolved_inputs[input_logical_name] = input_uri_template
 
-            # 5. Создание JobInstanceContext
-            job_context = JobInstanceContext(
-                experiment_id=task_instance.experiment_instance_id,
-                task_instance_id=task_instance.id,
-                job_instance_id=job_instance_id,
-                job_definition_ref=job_definition_reference,
-                resolved_parameters=final_resolved_parameters, 
-                resolved_inputs=current_step_resolved_inputs if current_step_resolved_inputs else None,
-                resolved_outputs=current_step_resolved_outputs if current_step_resolved_outputs else None,
-                resources_request=step_def.resources_request.model_dump(exclude_none=True) if step_def.resources_request else {},
-                priority=step_def.priority
-            )
-            
-            # 6. Определение зависимостей JobInstance
-            depends_on_job_ids_list: List[str] = []
-            if step_def.depends_on:
-                for dep_step_name in step_def.depends_on:
-                    if dep_step_name in job_name_to_id_map: # Используем job_name_to_id_map
-                        depends_on_job_ids_list.append(job_name_to_id_map[dep_step_name])
-                    else:
-                        logger.warning(f"Intra-task job dependency '{dep_step_name}' for job step "
-                              f"'{step_def.name}' in task '{task_instance.name}' not found. "
-                              f"Ensure steps are defined before being depended upon or check for circular dependencies.")
-            
+            # Блоки для JobInstanceContext и старой логики depends_on_job_ids_list удалены,
+            # так как новый JobInstance (ниже) напрямую использует необходимые поля
+            # и depends_on_job_ids вычисляются из current_job_dependency_names.
+
             # 7. Создание JobInstance
+            actual_job_dependency_ids = [
+                step_name_to_job_id_map[dep_name]
+                for dep_name in current_job_dependency_names
+                if dep_name in step_name_to_job_id_map
+            ]
+            # Log if a declared dependency was not found (e.g., typo or future step not yet processed - though loop order should prevent latter)
+            for dep_name in current_job_dependency_names:
+                if dep_name not in step_name_to_job_id_map:
+                    logger.warning(f"Step '{step_def.name}' has an unresolved dependency on step '{dep_name}'. It might be a typo or a step defined later in the task which is not supported for direct dependency resolution during expansion.")
+
             job_instance = JobInstance(
                 id=job_instance_id,
-                name=job_instance_display_name, 
+                name=job_instance_display_name,
                 task_instance_id=task_instance.id,
-                job_definition_ref=job_definition_reference, 
-                context=job_context,
-                status=InstanceStatus.PENDING, 
-                depends_on_job_ids=depends_on_job_ids_list, # Исправлено на depends_on_job_ids_list
-                created_at=datetime.now(timezone.utc) 
+                experiment_instance_id=task_instance.experiment_instance_id,
+                job_definition_ref=job_definition_reference,
+                parameters=final_resolved_parameters,
+                inputs=current_step_resolved_inputs,
+                resolved_outputs=current_job_produced_outputs, # Outputs resolved at expansion time
+                depends_on_job_ids=list(set(actual_job_dependency_ids)), # Actual JobInstance IDs
+                status=InstanceStatus.PENDING
+                # 'outputs' field in JobInstance might be used for artifact URIs generated at runtime by worker
             )
-            logger.info(f"Created JobInstance: ID={job_instance.id}, Name='{job_instance.name}'")
-            
-            job_instances_for_task.append(job_instance) # Исправлено на job_instances_for_task
-            job_name_to_id_map[step_def.name] = job_instance.id # Исправлено на job_name_to_id_map
+            job_instances_for_task.append(job_instance)
+            step_name_to_job_id_map[step_def.name] = job_instance.id
 
         return job_instances_for_task # Добавлен return
 

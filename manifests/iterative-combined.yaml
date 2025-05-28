@@ -1,0 +1,56 @@
+apiVersion: orchestrator.windsurf.ai/v1alpha1
+kind: Task # TaskDefinition
+metadata:
+  name: iterative-task-v1
+spec:
+  description: An iterative task that processes some data.
+  parametersSchema:
+    source_url:
+      type: string
+      description: URL of the data source.
+    rate:
+      type: number
+      description: Processing rate.
+  steps:
+  - name: process-data-step
+    executor: data_processor.DataProcessor # Пример исполнителя
+    parameters:
+      input_source: "{{parameters.source_url}}"
+      processing_rate: "{{parameters.rate}}"
+    # Пример шаблона для выходного артефакта
+    outputs_templates:
+      processed_data_path: "s3://my-bucket/{{experiment.id}}/{{task.id}}/{{job.id}}/processed_data.csv"
+---
+apiVersion: orchestrator.windsurf.ai/v1alpha1
+kind: Experiment
+metadata:
+  name: iterative-test-experiment
+spec:
+  description: An experiment with an iterative task.
+  globalParameters:
+    - name: global_default_rate
+      type: float
+      value: 0.65
+      description: "Default processing rate if not specified in iteration."
+    - name: global_batch_size
+      type: integer
+      value: 128
+      description: "Global batch size for all tasks that might use it."
+    - name: default_data_source
+      type: string
+      value: "http://example.com/default_data.csv"
+  pipeline:
+  - name: data-processing-iteration
+    taskReference: iterative-task-v1
+    iterate_over:
+    - parameters:
+        source_url: "http://example.com/data_batch_1.csv"
+        rate: 0.5 # Прямое значение, переопределяет global_default_rate
+        batch_size: "global://global_batch_size" # Используем глобальный batch_size
+    - parameters:
+        source_url: "http://example.com/data_batch_2.csv"
+        # rate не указан, будет использован global_default_rate
+        batch_size: 256 # Прямое значение, переопределяет global_batch_size
+    - parameters:
+        source_url: "global://default_data_source" # Используем глобальный источник данных
+        rate: "global://global_default_rate" # Явно используем глобальную ставку

@@ -1,0 +1,11 @@
+apiVersion: orchestrator.windsurf.ai/v1alpha1 # Версия схемы ресурса
+kind: Experiment
+metadata:
+  name: simple-test-experiment
+spec:
+  description: A very simple experiment with one task.
+  pipeline:
+  - name: first-simple-task
+    taskReference: simple-task-v1
+    parameters:
+      message: "Hello from simple experiment!"
