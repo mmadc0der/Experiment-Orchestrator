@@ -5,12 +5,17 @@ from pathlib import Path
 import logging as custom_logging
 import uvicorn
 from fastapi import FastAPI, HTTPException, APIRouter
+from contextlib import asynccontextmanager
 from pydantic import BaseModel
+import redis # For Redis specific exceptions
 
 from logger import init_logging
 logger = custom_logging.getLogger(__name__)
 from manifest_processing.manifest_parser import ManifestParser
 from manifest_processing.manifest_expander import ManifestExpander
+from brokers.redis_broker import RedisBroker
+from models.instances import InstanceStatus, ExperimentInstance, TaskInstance, JobInstance # Ensure all are imported
+from scheduler import Scheduler
 
 CONFIG_FILE_NAME = "config.yaml"
 DEFAULT_LOG_FORMAT = "%(asctime)s %(levelname)s [%(process)d:%(threadName)s] %(funcName)s: %(message)s"
@@ -32,9 +37,11 @@ class Orchestrator:
         self.config = self._load_config()
         self._configure_logging()
         logger.info(f"Orchestrator initialized. Workspace: {self.workspace_path}")
-        logger.info(f"Configuration loaded: {self.config}")
+        logger.info(f"Configuration loaded: {CONFIG_FILE_NAME}")
         self.manifest_parser = ManifestParser()
         self._ensure_directories()
+        self.redis_broker = self._initialize_redis_broker()
+        self.scheduler = self._initialize_scheduler()
 
     def _load_config(self) -> dict:
         config_path = self.workspace_path / CONFIG_FILE_NAME
@@ -93,6 +100,55 @@ class Orchestrator:
                 logger.info(f"Ensured directory exists: {dir_path}")
             except Exception as e:
                 logger.error(f"Could not create directory {dir_path}: {e}")
+
+    def _initialize_redis_broker(self) -> RedisBroker | None:
+        redis_config = self.config.get("redis")
+        if not redis_config:
+            logger.error(f"Redis configuration ('redis:') not found in {CONFIG_FILE_NAME}. RedisBroker will not be initialized.")
+            return None
+        
+        try:
+            host = redis_config.get("host", "localhost")
+            port = int(redis_config.get("port", 6379))
+            db = int(redis_config.get("db", 0))
+            username = redis_config.get("username") # Can be None
+            password = redis_config.get("password") # Can be None
+            key_prefix_user = redis_config.get("key_prefix_user", "")
+            
+            broker = RedisBroker(
+                host=host, 
+                port=port, 
+                db=db, 
+                username=username, 
+                password=password, 
+                key_prefix_user=key_prefix_user
+            )
+            logger.info(f"RedisBroker initialized successfully with prefix '{key_prefix_user}'.")
+            return broker
+        except redis.exceptions.RedisError as e: # Catch generic Redis errors from broker's init
+            logger.error(f"Failed to initialize RedisBroker: {e}. Orchestrator will continue without Redis integration for now.")
+            return None
+        except ValueError as e:
+            logger.error(f"Invalid Redis configuration value (e.g., port or db not an int): {e}. RedisBroker not initialized.")
+            return None
+        except Exception as e:
+            logger.error(f"An unexpected error occurred during RedisBroker initialization: {e}. RedisBroker not initialized.", exc_info=True)
+            return None
+
+    def _initialize_scheduler(self) -> Scheduler | None:
+        if not self.redis_broker:
+            logger.error("RedisBroker is not initialized. Scheduler cannot be started.")
+            return None
+        
+        scheduler_config = self.config.get("scheduler", {})
+        try:
+            scheduler_instance = Scheduler(redis_broker=self.redis_broker, config=scheduler_config)
+            scheduler_instance.start()
+            logger.info("Scheduler initialized and started.")
+            return scheduler_instance
+        except Exception as e:
+            logger.error(f"Failed to initialize or start Scheduler: {e}", exc_info=True)
+            return None
 
     def process_manifest_from_string_content(self, manifest_yaml_string: str) -> dict: # Переименовано
         """
@@ -175,6 +231,24 @@ class Orchestrator:
                 logger.info(f"Document {i+1} (Kind: {kind}, Name: {name}) acknowledged. Specific processing for this kind TBD.")
                 processed_doc_details.append({"kind": kind, "name": name, "status": "acknowledged_other_kind"})
         
+        if expansion_successful and self.scheduler:
+            logger.info("Submitting expanded job details to Scheduler...")
+            try:
+                self.scheduler.submit_experiment_jobs(experiment_instance, task_instances, job_instances)
+                logger.info("Successfully submitted job details to Scheduler.")
+                # We'll rely on the scheduler's logs for individual job submission status
+                # and update the redis_storage_status based on whether scheduler accepted it.
+                # For now, assume success if no exception from submit_experiment_jobs.
+                redis_ops_summary = ["Scheduler accepted jobs."] # Simplified summary
+            except Exception as e:
+                logger.error(f"Error submitting jobs to Scheduler: {e}", exc_info=True)
+                redis_ops_summary = [f"ERROR submitting to Scheduler: {e}"]
+        elif expansion_successful and not self.scheduler:
+            logger.warning("Scheduler not available. Cannot submit jobs for processing.")
+            redis_ops_summary = ["Scheduler not available."]
+        else:
+            redis_ops_summary = ["Expansion not successful or no jobs to submit."]
+
         if expansion_successful:
             return {
                 "status": "accepted_experiment_expanded",
@@ -182,7 +256,8 @@ class Orchestrator:
                 "expansion_details": {
                     "experiment_instance_id": experiment_instance.id if experiment_instance else None,
                     "task_instance_count": len(task_instances),
-                    "job_instance_count": len(job_instances)
+                    "job_instance_count": len(job_instances),
+                    "submission_status": "success" if self.scheduler and "Scheduler accepted jobs." in redis_ops_summary else ("scheduler_unavailable" if not self.scheduler else "error_during_submission")
                 },
                 "processed_documents": processed_doc_details,
                 "all_kinds_in_manifest": list(set(all_kinds_in_manifest))
@@ -209,7 +284,24 @@ class Orchestrator:
         logger.warning(f"Actual processing/scheduling logic for Experiment '{exp_name}' is not yet implemented.")
 
 # --- FastAPI приложение ---
-app = FastAPI(title="Experiment Orchestrator API")
+@asynccontextmanager
+async def lifespan(app_instance: FastAPI):
+    # The scheduler is started during Orchestrator initialization.
+    # We could add other startup logic here if needed.
+    logger.info("Application startup: Orchestrator initialized, scheduler should be running.")
+    yield
+    # Code to execute during shutdown
+    logger.info("Application shutdown: Attempting to stop scheduler...")
+    if orchestrator_service and orchestrator_service.scheduler:
+        try:
+            orchestrator_service.scheduler.stop()
+            logger.info("Scheduler stopped successfully.")
+        except Exception as e:
+            logger.error(f"Error stopping scheduler: {e}", exc_info=True)
+    else:
+        logger.warning("Scheduler instance not found or not initialized, skipping stop.")
+
+app = FastAPI(title="Experiment Orchestrator API", lifespan=lifespan)
 api_router = APIRouter()
 orchestrator_service = Orchestrator()
 

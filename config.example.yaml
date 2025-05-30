@@ -23,4 +23,9 @@ redis:
   db: 0
   username: "default"  # Or your specific username, use null or omit if not using ACLs with username
   password: "your_redis_password" # Use null or omit if no password
-  key_prefix_user: "user@" # Prefix for all keys, e.g., 'user@' or 'my_app_user@'
+  key_prefix_user: "expdb@" # User-specific prefix for all keys related to this user/instance
+
+scheduler:
+  polling_interval_seconds: 5      # How often the scheduler checks for pending jobs (in seconds)
+  default_worker_queue: "orchestrator_default_worker_queue" # Default Redis list name for jobs ready for workers
+  # max_concurrent_resolutions: 10 # Example: Max jobs to process for dependency resolution in one cycle

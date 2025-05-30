@@ -4,11 +4,15 @@ from typing import Any, Dict, List, Optional
 
 import redis # type: ignore
 
-from models.instances import InstanceStatus # Assuming InstanceStatus is in models.instances
+from models.instances import InstanceStatus, JobInstance
 
 logger = logging.getLogger(__name__)
 
 class RedisBroker:
+    placeholder: Any = "__PENDING__"
+    empty_hash_placeholder_field: str = "__empty_hash__"
+    empty_hash_placeholder_value: str = "1"
+
     def __init__(self, host: str = 'localhost', port: int = 6379, db: int = 0, 
                  username: Optional[str] = None, password: Optional[str] = None, 
                  key_prefix_user: str = ""):
@@ -42,6 +46,16 @@ class RedisBroker:
             logger.error(f"Failed to connect to Redis at {host}:{port}, db {db}: {e}")
             raise
 
+    def _get_prefixed_key(self, key_name: str) -> str:
+        """
+        Applies the user-specific prefix to a key if the prefix is defined.
+        """
+        if self.key_prefix_user:
+            # Assuming self.key_prefix_user (e.g., 'expdb@') already contains
+            # the desired separator if one is needed.
+            return f"{self.key_prefix_user}{key_name}"
+        return key_name
+
     def _serialize(self, value: Any) -> bytes:
         """Serializes a Python object to bytes for Redis storage."""
         if isinstance(value, bytes):
@@ -73,9 +87,34 @@ class RedisBroker:
             logger.warning("Could not decode bytes as UTF-8, returning raw bytes.")
             return value_bytes # Fallback for non-UTF-8 binary data
 
+    def store_job_details(self, job_id: str, job_instance: JobInstance) -> None:
+        """Stores the full JobInstance object as a JSON string in Redis."""
+        key = self._get_prefixed_key(f"job:{job_id}:details")
+        try:
+            job_instance_json = job_instance.model_dump_json()
+            self.redis_client.set(key, job_instance_json)
+            logger.debug(f"Stored details for job {job_id} at key {key}")
+        except Exception as e:
+            logger.error(f"Error storing details for job {job_id}: {e}", exc_info=True)
+            raise
+
+    def get_job_details(self, job_id: str) -> Optional[str]:
+        """Retrieves the JobInstance JSON string from Redis."""
+        key = self._get_prefixed_key(f"job:{job_id}:details")
+        try:
+            value_bytes = self.redis_client.get(key)
+            if value_bytes:
+                logger.debug(f"Retrieved details for job {job_id} from key {key}")
+                return value_bytes.decode('utf-8')
+            logger.warning(f"No details found for job {job_id} at key {key}")
+            return None
+        except Exception as e:
+            logger.error(f"Error retrieving details for job {job_id}: {e}", exc_info=True)
+            return None
+
     def set_job_input_literals(self, job_id: str, literals: Dict[str, Any]) -> None:
         """Stores the input literal values for a job."""
-        key = f"{self.key_prefix_user}job:{job_id}:input_literals"
+        key = self._get_prefixed_key(f"job:{job_id}:input_literals")
         serialized_literals = {k: self._serialize(v) for k, v in literals.items()}
         if serialized_literals: # Redis HMSET requires a non-empty mapping
             self.redis_client.hmset(key, serialized_literals)
@@ -85,42 +124,108 @@ class RedisBroker:
 
     def get_job_input_literals(self, job_id: str) -> Dict[str, Any]:
         """Retrieves the input literal values for a job."""
-        key = f"{self.key_prefix_user}job:{job_id}:input_literals"
+        key = self._get_prefixed_key(f"job:{job_id}:input_literals")
         serialized_literals = self.redis_client.hgetall(key)
         return {k.decode('utf-8'): self._deserialize(v) for k, v in serialized_literals.items()}
 
+    def set_job_resolved_inputs(self, job_id: str, resolved_inputs: Dict[str, Any]) -> None:
+        """Stores the resolved input parameters for a job."""
+        # key variable is defined below for both branches
+        if not resolved_inputs:
+            key = self._get_prefixed_key(f"job:{job_id}:resolved_inputs") # Define key here for logging
+            prefixed_key = self._get_prefixed_key(f"job:{job_id}:resolved_inputs") # Get key for delete and hmset
+            self.redis_client.delete(prefixed_key) # Ensure clean state
+            self.redis_client.hmset(prefixed_key, {self.empty_hash_placeholder_field: self.empty_hash_placeholder_value})
+            logger.debug(f"Stored empty placeholder for resolved inputs for job {job_id} at {key}")
+            return
+        try:
+            key = self._get_prefixed_key(f"job:{job_id}:resolved_inputs") # Define key here for this branch
+            serialized_inputs = {k: self._serialize(v) for k, v in resolved_inputs.items()}
+            self.redis_client.hmset(key, serialized_inputs)
+            logger.debug(f"Stored resolved inputs for job {job_id} at {key}: {list(resolved_inputs.keys())}")
+        except Exception as e:
+            logger.error(f"Error setting resolved inputs for job {job_id}: {e}", exc_info=True)
+            raise
+
+    def get_job_resolved_inputs(self, job_id: str) -> Optional[Dict[str, Any]]:
+        """Retrieves the resolved input parameters for a job."""
+        key = self._get_prefixed_key(f"job:{job_id}:resolved_inputs")
+        try:
+            value_dict_bytes = self.redis_client.hgetall(key)
+            if not value_dict_bytes:
+                logger.warning(f"No resolved inputs found for job {job_id} at key {key}")
+                return None
+            
+            if self.empty_hash_placeholder_field.encode('utf-8') in value_dict_bytes and \
+               len(value_dict_bytes) == 1:
+                logger.debug(f"Resolved inputs for job {job_id} is an intentionally empty set.")
+                return {}
+
+            deserialized_inputs = {k.decode('utf-8'): self._deserialize(v) 
+                                   for k, v in value_dict_bytes.items()}
+            logger.debug(f"Retrieved resolved inputs for job {job_id} from {key}")
+            return deserialized_inputs
+        except Exception as e:
+            logger.error(f"Error getting resolved inputs for job {job_id}: {e}", exc_info=True)
+            return None
+
     def set_job_output_value(self, job_id: str, output_name: str, value: Any) -> None:
         """Stores a specific output value for a job."""
-        key = f"{self.key_prefix_user}job:{job_id}:outputs:{output_name}"
+        key = self._get_prefixed_key(f"job:{job_id}:outputs:{output_name}")
         self.redis_client.set(key, self._serialize(value))
         logger.debug(f"Stored output '{output_name}' for job {job_id} at key {key}")
 
     def get_job_output_value(self, job_id: str, output_name: str) -> Any:
         """Retrieves a specific output value for a job."""
-        key = f"{self.key_prefix_user}job:{job_id}:outputs:{output_name}"
+        key = self._get_prefixed_key(f"job:{job_id}:outputs:{output_name}")
         value_bytes = self.redis_client.get(key)
         return self._deserialize(value_bytes)
 
-    def register_job_outputs(self, job_id: str, output_names: List[str], placeholder: Any = "__PENDING__") -> None:
+    def register_job_outputs(self, job_id: str, output_names: List[str], placeholder: Any = None) -> None:
+        if placeholder is None:
+            placeholder = self.placeholder
         """Registers output keys for a job with a placeholder value (e.g., to signify they are pending)."""
         # This could also be implemented using a set for job_id:outputs_pending or similar
         # For simplicity, we'll set each output key with a placeholder.
         serialized_placeholder = self._serialize(placeholder)
         for output_name in output_names:
-            key = f"{self.key_prefix_user}job:{job_id}:outputs:{output_name}"
+            key = self._get_prefixed_key(f"job:{job_id}:outputs:{output_name}")
             # SETNX ensures we only set it if it doesn't exist, useful if registration can happen multiple times
             self.redis_client.setnx(key, serialized_placeholder)
             logger.debug(f"Registered output '{output_name}' for job {job_id} with placeholder at key {key}")
 
-    def set_job_status(self, job_id: str, status: InstanceStatus) -> None:
-        """Sets the status for a job."""
-        key = f"{self.key_prefix_user}job:{job_id}:status"
-        self.redis_client.set(key, status.value) # Store enum by its value
-        logger.debug(f"Set status for job {job_id} to {status.value} at key {key}")
+    def set_job_status(self, job_id: str, status: str) -> None:
+        """Sets the status for a job. Expects status to be the string value of the enum.
+        Example: InstanceStatus.PENDING.value
+        """
+        key = self._get_prefixed_key(f"job:{job_id}:status")
+        self.redis_client.set(key, status) # Store enum by its value (status is already a string value)
+        logger.debug(f"Set status for job {job_id} to {status} at key {key}")
+
+    def set_job_error_info(self, job_id: str, error_message: str) -> None:
+        """Stores error information for a job."""
+        key = self._get_prefixed_key(f"job:{job_id}:error")
+        try:
+            self.redis_client.set(key, error_message)
+            logger.debug(f"Error info for job {job_id} set at key {key}")
+        except Exception as e:
+            logger.error(f"Error setting error info for job {job_id}: {e}", exc_info=True)
+
+    def get_job_error_info(self, job_id: str) -> Optional[str]:
+        """Retrieves error information for a job."""
+        key = self._get_prefixed_key(f"job:{job_id}:error")
+        try:
+            value_bytes = self.redis_client.get(key)
+            if value_bytes:
+                return value_bytes.decode('utf-8')
+            return None
+        except Exception as e:
+            logger.error(f"Error retrieving error info for job {job_id}: {e}", exc_info=True)
+            return None
 
     def get_job_status(self, job_id: str) -> Optional[InstanceStatus]:
         """Retrieves the status for a job."""
-        key = f"{self.key_prefix_user}job:{job_id}:status"
+        key = self._get_prefixed_key(f"job:{job_id}:status")
         status_value_bytes = self.redis_client.get(key)
         if status_value_bytes:
             status_value = status_value_bytes.decode('utf-8')
@@ -131,9 +236,56 @@ class RedisBroker:
                 return None
         return None
 
+    # --- Scheduler-specific Sets and Queues ---
+
+    def add_job_to_pending_set(self, set_key_name: str, job_id: str) -> None:
+        """Adds a job ID to a Redis set (e.g., for pending jobs)."""
+        # Note: set_key_name is the base name, prefix is applied by _get_prefixed_key.
+        prefixed_key = self._get_prefixed_key(set_key_name)
+        try:
+            self.redis_client.sadd(prefixed_key, job_id)
+            logger.debug(f"Added job {job_id} to set {prefixed_key}")
+        except Exception as e:
+            logger.error(f"Error adding job {job_id} to set {key}: {e}", exc_info=True)
+            raise
+
+    def get_job_ids_from_set(self, set_key_name: str) -> List[str]:
+        """Retrieves all job IDs from a Redis set."""
+        prefixed_key = self._get_prefixed_key(set_key_name)
+        try:
+            job_ids_bytes = self.redis_client.smembers(prefixed_key)
+            job_ids = [jid.decode('utf-8') for jid in job_ids_bytes]
+            logger.debug(f"Retrieved {len(job_ids)} job IDs from set {prefixed_key}")
+            return job_ids
+        except Exception as e:
+            logger.error(f"Error retrieving job IDs from set {key}: {e}", exc_info=True)
+            return []
+
+    def remove_job_from_set(self, set_key_name: str, job_id: str) -> None:
+        """Removes a job ID from a Redis set."""
+        prefixed_key = self._get_prefixed_key(set_key_name)
+        try:
+            self.redis_client.srem(prefixed_key, job_id)
+            logger.debug(f"Removed job {job_id} from set {prefixed_key}")
+        except Exception as e:
+            logger.error(f"Error removing job {job_id} from set {key}: {e}", exc_info=True)
+            raise
+
+    def push_job_to_worker_queue(self, queue_key_name: str, job_id: str) -> None:
+        """Pushes a job ID to a Redis list (worker queue)."""
+        # Note: queue_key_name is the base name, prefix is applied by _get_prefixed_key.
+        prefixed_key = self._get_prefixed_key(queue_key_name)
+        try:
+            self.redis_client.rpush(prefixed_key, job_id)
+            logger.debug(f"Pushed job {job_id} to queue {prefixed_key}")
+        except Exception as e:
+            logger.error(f"Error pushing job {job_id} to queue {key}: {e}", exc_info=True)
+            raise
+
+    # --- Generic Queue Operations (can be used by worker or other components) ---
     def get_all_job_outputs(self, job_id: str) -> Dict[str, Any]:
         """Retrieves all output values for a given job."""
-        outputs_pattern = f"{self.key_prefix_user}job:{job_id}:outputs:*"
+        outputs_pattern = self._get_prefixed_key(f"job:{job_id}:outputs:*")
         output_keys = [key.decode('utf-8') for key in self.redis_client.keys(outputs_pattern)]
         
         outputs = {}
@@ -145,7 +297,7 @@ class RedisBroker:
 
     def add_job_to_queue(self, queue_name: str, job_id: str) -> None:
         """Adds a job ID to a specific queue (e.g., 'pending_jobs')."""
-        prefixed_queue_name = f"{self.key_prefix_user}{queue_name}"
+        prefixed_queue_name = self._get_prefixed_key(queue_name)
         self.redis_client.rpush(prefixed_queue_name, job_id)
         logger.info(f"Added job {job_id} to queue {queue_name}")
 
@@ -153,7 +305,7 @@ class RedisBroker:
         """Retrieves a job ID from a specific queue. Blocks if timeout > 0."""
         # BLPOP is a blocking list pop operation.
         # It returns a tuple (list_name, item_popped) or None if timeout occurs.
-        prefixed_queue_name = f"{self.key_prefix_user}{queue_name}"
+        prefixed_queue_name = self._get_prefixed_key(queue_name)
         result = self.redis_client.blpop([prefixed_queue_name], timeout=timeout)
         if result:
             job_id_bytes = result[1]
@@ -179,7 +331,7 @@ class RedisBroker:
             # This depends on how outputs are named and registered.
             # For this example, let's assume a common output name like 'result'.
             dep_output = self.get_job_output_value(dep_job_id, required_output_name)
-            if dep_output is None or dep_output == self._deserialize(self._serialize("__PENDING__")):
+            if dep_output is None or dep_output == self.placeholder:
                 logger.debug(f"Dependency job {dep_job_id} for job {job_id} has not produced output '{required_output_name}'.")
                 return False
         return True
