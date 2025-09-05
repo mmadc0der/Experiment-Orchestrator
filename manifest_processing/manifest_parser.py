@@ -22,10 +22,11 @@ class ManifestParseError(Exception):
 
 class ManifestValidationError(Exception):
     """Custom exception for manifest validation errors."""
-    def __init__(self, message: str, resource_kind: Optional[str] = None, resource_name: Optional[str] = None):
+    def __init__(self, message: str, resource_kind: Optional[str] = None, resource_name: Optional[str] = None, file_path: Optional[str] = None):
         self.message = message
         self.resource_kind = resource_kind
         self.resource_name = resource_name
+        self.file_path = file_path
         super().__init__(self.message)
 
 class ManifestParser:
@@ -86,18 +87,17 @@ class ManifestParser:
             if self.validate_schemas:
                 validated_documents = []
                 for i, doc in enumerate(documents):
-                    try:
-                        validated_doc = self._validate_resource(doc, file_path, i + 1)
-                        validated_documents.append(validated_doc)
-                    except ManifestValidationError as e:
-                        logger.error(f"Validation failed for document {i + 1} in {file_path}: {e}")
-                        raise
+                    validated_doc = self._validate_resource(doc, file_path, i + 1)
+                    validated_documents.append(validated_doc)
                 return validated_documents
             else:
                 return documents
                 
         except yaml.YAMLError as e:
             raise ManifestParseError(f"YAML parsing error in file {file_path}: {e}", file_path=file_path)
+        except ManifestValidationError:
+            # Re-raise validation errors as-is
+            raise
         except Exception as e:
             raise ManifestParseError(f"Failed to read manifest file {file_path}: {e}", file_path=file_path)
 
@@ -131,18 +131,17 @@ class ManifestParser:
             if self.validate_schemas:
                 validated_documents = []
                 for i, doc in enumerate(documents):
-                    try:
-                        validated_doc = self._validate_resource(doc, "string_input", i + 1)
-                        validated_documents.append(validated_doc)
-                    except ManifestValidationError as e:
-                        logger.error(f"Validation failed for document {i + 1} in YAML string: {e}")
-                        raise
+                    validated_doc = self._validate_resource(doc, "string_input", i + 1)
+                    validated_documents.append(validated_doc)
                 return validated_documents
             else:
                 return documents
                 
         except yaml.YAMLError as e:
             raise ManifestParseError(f"YAML parsing error in string content: {e}")
+        except ManifestValidationError:
+            # Re-raise validation errors as-is
+            raise
         except Exception as e:
             raise ManifestParseError(f"Failed to parse manifest from string: {e}")
     
@@ -208,7 +207,7 @@ class ManifestParser:
             definition_class = self.RESOURCE_KINDS[kind]
             validated_resource = definition_class(**resource_dict)
             logger.debug(f"Successfully validated {kind} resource: {resource_name}")
-            return validated_resource.dict()
+            return validated_resource.model_dump()
         except Exception as e:
             raise ManifestValidationError(
                 f"Schema validation failed for {kind} resource '{resource_name}': {e}",

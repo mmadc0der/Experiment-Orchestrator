@@ -160,7 +160,8 @@ class TestOrchestrator:
             
             assert result["status"] == "success"
             assert "message" in result
-            mock_expander_instance.expand_manifest.assert_called_once()
+            # ManifestExpander should not be called when there's no Experiment in the manifest
+            mock_expander_instance.expand_manifest.assert_not_called()
     
     def test_process_manifest_from_string_content_parse_error(self, temp_workspace, test_config):
         """Test manifest processing with parse error."""
@@ -221,7 +222,7 @@ spec:
             assert result["status"] == "error"
             assert "Unknown resource kind" in result["message"]
     
-    def test_process_manifest_from_string_content_expansion_error(self, temp_workspace, test_config, sample_task_manifest):
+    def test_process_manifest_from_string_content_expansion_error(self, temp_workspace, test_config, sample_experiment_manifest):
         """Test manifest processing with expansion error."""
         # Create config file
         config_path = temp_workspace / "config.yaml"
@@ -241,10 +242,10 @@ spec:
             
             mock_expander_instance = Mock()
             mock_expander.return_value = mock_expander_instance
-            mock_expander_instance.expand_manifest.side_effect = Exception("Expansion failed")
+            mock_expander_instance.process_manifest.side_effect = Exception("Expansion failed")
             
             orchestrator = Orchestrator(workspace_path=str(temp_workspace))
-            result = orchestrator.process_manifest_from_string_content(sample_task_manifest)
+            result = orchestrator.process_manifest_from_string_content(sample_experiment_manifest)
             
             assert result["status"] == "error"
             assert "Expansion failed" in result["message"]
@@ -270,7 +271,7 @@ spec:
             result = orchestrator.process_manifest_from_string_content("")
             
             assert result["status"] == "success"
-            assert "No valid documents" in result["message"]
+            assert "No documents found or parsed from manifest string content" in result["message"]
     
     def test_process_manifest_from_string_content_multiple_documents(self, temp_workspace, test_config, 
                                                                    sample_task_manifest, sample_experiment_manifest):
@@ -293,22 +294,21 @@ spec:
             
             mock_expander_instance = Mock()
             mock_expander.return_value = mock_expander_instance
-            mock_expander_instance.expand_manifest.return_value = {
-                "experiments": [{"name": "test-experiment"}],
-                "tasks": [{"name": "test-task"}],
-                "environments": [],
-                "data": [],
-                "models": []
-            }
+            # Mock the process_manifest method which returns the tuple
+            mock_expander_instance.process_manifest.return_value = (
+                Mock(id="exp-123", name="test-experiment"),  # experiment_instance
+                [Mock(id="task-123", name="test-task")],     # task_instances
+                [Mock(id="job-123", name="test-job")]        # job_instances
+            )
             
             orchestrator = Orchestrator(workspace_path=str(temp_workspace))
             
             multi_doc_manifest = f"{sample_task_manifest}\n---\n{sample_experiment_manifest}"
             result = orchestrator.process_manifest_from_string_content(multi_doc_manifest)
             
-            assert result["status"] == "success"
-            assert result["details"]["processed_documents"] == 2
-            mock_expander_instance.expand_manifest.assert_called_once()
+            assert result["status"] == "accepted_experiment_expanded"
+            assert len(result["processed_documents"]) == 2
+            mock_expander_instance.process_manifest.assert_called_once()
     
     def test_orchestrator_cleanup(self, temp_workspace, test_config):
         """Test orchestrator cleanup."""
@@ -361,7 +361,7 @@ class TestOrchestratorEdgeCases:
             orchestrator = Orchestrator(workspace_path=str(temp_workspace))
             assert orchestrator.config is not None
     
-    def test_orchestrator_workspace_creation(self, tempfile.TemporaryDirectory):
+    def test_orchestrator_workspace_creation(self):
         """Test orchestrator with non-existent workspace."""
         with tempfile.TemporaryDirectory() as temp_dir:
             workspace_path = Path(temp_dir) / "nonexistent" / "workspace"
@@ -474,4 +474,4 @@ spec:
             result = orchestrator.process_manifest_from_string_content(large_manifest)
             
             assert result["status"] == "success"
-            assert result["details"]["processed_documents"] == 100
+            assert len(result["processed_documents"]) == 100

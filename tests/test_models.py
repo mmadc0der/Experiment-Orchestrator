@@ -148,23 +148,27 @@ class TestTaskSpecification:
         assert spec.steps[0].name == "train"
     
     def test_task_specification_parameter_name_population(self):
-        """Test that parameter names are automatically populated."""
-        spec = TaskSpecification(
-            steps=[
-                JobStepDefinition(
-                    name="train",
-                    executor="test.job:TrainJob"
-                )
+        """Test that parameter name population works correctly."""
+        # Create the data as it would come from YAML parsing
+        data = {
+            "steps": [
+                {
+                    "name": "train",
+                    "executor": "test.job:TrainJob"
+                }
             ],
-            parameters_schema={
+            "parametersSchema": {
                 "epochs": {
                     "type": "integer",
                     "default": 10
                 }
             }
-        )
+        }
+        spec = TaskSpecification(**data)
+        # Check that the parameter name was populated
         assert "epochs" in spec.parameters_schema
-        assert spec.parameters_schema["epochs"].name == "epochs"
+        epochs_param = spec.parameters_schema["epochs"]
+        assert epochs_param.name == "epochs"
 
 
 class TestTaskDefinition:
@@ -463,7 +467,7 @@ class TestTaskInstance:
         """Test valid task instance."""
         task = sample_task_instance
         assert task.id == "task-123"
-        assert task.experiment_id == "exp-123"
+        assert task.experiment_instance_id == "exp-123"
         assert task.status == InstanceStatus.PENDING
 
 
@@ -474,7 +478,7 @@ class TestJobInstance:
         """Test valid job instance."""
         job = sample_job_instance
         assert job.id == "job-123"
-        assert job.experiment_id == "exp-123"
+        assert job.context.experiment_id == "exp-123"
         assert job.task_instance_id == "task-123"
         assert job.status == InstanceStatus.PENDING
 
@@ -496,12 +500,12 @@ class TestModelValidation:
     
     def test_task_specification_empty_steps(self):
         """Test task specification with empty steps."""
-        with pytest.raises(ValidationError, match="ensure this value has at least 1 items"):
+        with pytest.raises(ValidationError, match="steps list cannot be empty"):
             TaskSpecification(steps=[])
     
     def test_experiment_specification_empty_pipeline(self):
         """Test experiment specification with empty pipeline."""
-        with pytest.raises(ValidationError, match="ensure this value has at least 1 items"):
+        with pytest.raises(ValidationError, match="pipeline list cannot be empty"):
             ExperimentSpecification(pipeline=[])
     
     def test_environment_specification_invalid_type(self):

@@ -7,7 +7,7 @@ import os
 import yaml
 from pathlib import Path
 from typing import Dict, Any, Optional, List
-from pydantic import BaseModel, Field, validator, root_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 import logging
 
 logger = logging.getLogger(__name__)
@@ -22,7 +22,8 @@ class LoggingConfig(BaseModel):
     )
     rotation: Optional[Dict[str, Any]] = Field(default=None, description="Log rotation settings")
     
-    @validator('file_level', 'console_level')
+    @field_validator('file_level', 'console_level')
+    @classmethod
     def validate_log_level(cls, v):
         valid_levels = ['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL']
         if v.upper() not in valid_levels:
@@ -36,7 +37,8 @@ class PathsConfig(BaseModel):
     runtime_root: str = Field(default="runtime", description="Root directory for storing runtime data")
     log_dir: str = Field(default="log", description="Directory for log files")
     
-    @validator('*')
+    @field_validator('*')
+    @classmethod
     def validate_paths(cls, v):
         if not v or not isinstance(v, str):
             raise ValueError("Path must be a non-empty string")
@@ -51,7 +53,8 @@ class RedisConfig(BaseModel):
     password: Optional[str] = Field(default=None, description="Redis password")
     key_prefix_user: str = Field(default="expdb@", description="User-specific prefix for Redis keys")
     
-    @validator('port')
+    @field_validator('port')
+    @classmethod
     def validate_port(cls, v):
         if not 1 <= v <= 65535:
             raise ValueError("Port must be between 1 and 65535")
@@ -66,7 +69,8 @@ class SchedulerConfig(BaseModel):
     worker_resources_updates_channel: str = Field(default="worker_resources_updates", description="Redis Pub/Sub channel for worker resource updates")
     max_concurrent_resolutions: Optional[int] = Field(default=None, description="Maximum concurrent dependency resolutions")
     
-    @validator('polling_interval_seconds')
+    @field_validator('polling_interval_seconds')
+    @classmethod
     def validate_polling_interval(cls, v):
         if v < 1:
             raise ValueError("Polling interval must be at least 1 second")
@@ -79,22 +83,20 @@ class OrchestratorConfig(BaseModel):
     redis: RedisConfig = Field(default_factory=RedisConfig, description="Redis configuration")
     scheduler: SchedulerConfig = Field(default_factory=SchedulerConfig, description="Scheduler configuration")
     
-    @root_validator
-    def validate_paths_exist(cls, values):
+    @model_validator(mode='after')
+    def validate_paths_exist(self):
         """Validate that configured paths can be created."""
-        paths_config = values.get('paths')
-        if paths_config:
-            # Check if paths are absolute or relative
-            for field_name, path_value in paths_config.dict().items():
-                if field_name == 'modules_root' and not os.path.exists(path_value):
-                    logger.warning(f"Modules root path does not exist: {path_value}")
-                elif field_name == 'artifacts_root' and not os.path.exists(path_value):
-                    logger.warning(f"Artifacts root path does not exist: {path_value}")
-                elif field_name == 'runtime_root' and not os.path.exists(path_value):
-                    logger.warning(f"Runtime root path does not exist: {path_value}")
-                elif field_name == 'log_dir' and not os.path.exists(path_value):
-                    logger.warning(f"Log directory does not exist: {path_value}")
-        return values
+        # Check if paths are absolute or relative
+        for field_name, path_value in self.paths.model_dump().items():
+            if field_name == 'modules_root' and not os.path.exists(path_value):
+                logger.warning(f"Modules root path does not exist: {path_value}")
+            elif field_name == 'artifacts_root' and not os.path.exists(path_value):
+                logger.warning(f"Artifacts root path does not exist: {path_value}")
+            elif field_name == 'runtime_root' and not os.path.exists(path_value):
+                logger.warning(f"Runtime root path does not exist: {path_value}")
+            elif field_name == 'log_dir' and not os.path.exists(path_value):
+                logger.warning(f"Log directory does not exist: {path_value}")
+        return self
 
 class ConfigValidator:
     """Configuration validator and manager."""
@@ -128,7 +130,9 @@ class ConfigValidator:
             
         except yaml.YAMLError as e:
             logger.error(f"Error parsing YAML configuration file: {e}")
-            raise ValueError(f"Invalid YAML in configuration file: {e}")
+            logger.warning("Using default configuration due to YAML parsing error.")
+            self.config = OrchestratorConfig()
+            return self.config
         except Exception as e:
             logger.error(f"Error loading configuration: {e}")
             raise ValueError(f"Configuration validation failed: {e}")
@@ -181,7 +185,7 @@ class ConfigValidator:
     
     def get_default_config_dict(self) -> Dict[str, Any]:
         """Get default configuration as dictionary."""
-        return OrchestratorConfig().dict()
+        return OrchestratorConfig().model_dump()
     
     def save_default_config(self, workspace_path: str = ".") -> None:
         """Save default configuration to file."""

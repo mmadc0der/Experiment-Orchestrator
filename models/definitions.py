@@ -1,6 +1,6 @@
 from typing import Any, Dict, List, Optional, Literal, Union
 from datetime import datetime, timezone # Added timezone
-from pydantic import BaseModel, Field, model_validator, validator, root_validator
+from pydantic import BaseModel, Field, model_validator, field_validator
 
 # --- Common Reusable Models for Definitions ---
 
@@ -76,6 +76,14 @@ class TaskSpecification(BaseModel):
                         param_def['name'] = param_name
         return data
 
+    @field_validator('steps')
+    @classmethod
+    def validate_steps_not_empty(cls, v):
+        """Validate that steps list is not empty."""
+        if not v:
+            raise ValueError('steps list cannot be empty')
+        return v
+
 class TaskDefinition(BaseModel):
     api_version: str = Field(..., alias="apiVersion", description="API version of the TaskDefinition schema")
     kind: Literal["Task"] = Field(..., description="Resource kind, must be 'Task'")
@@ -146,6 +154,14 @@ class ExperimentSpecification(BaseModel):
                     if isinstance(param_def, dict) and 'name' not in param_def:
                         param_def['name'] = param_name
         return data
+
+    @field_validator('pipeline')
+    @classmethod
+    def validate_pipeline_not_empty(cls, v):
+        """Validate that pipeline list is not empty."""
+        if not v:
+            raise ValueError('pipeline list cannot be empty')
+        return v
 
 class ExperimentDefinition(BaseModel):
     api_version: str = Field(..., alias="apiVersion", description="API version of the ExperimentDefinition schema")

@@ -163,7 +163,7 @@ class TestRedisBroker:
         """Test job status setting failure."""
         mock_client = Mock()
         mock_client.ping.return_value = True
-        mock_client.hset.side_effect = redis.exceptions.RedisError("Status error")
+        mock_client.set.side_effect = redis.exceptions.RedisError("Status error")
         mock_redis.return_value = mock_client
         
         broker = RedisBroker(key_prefix_user="test@")
@@ -310,7 +310,7 @@ class TestRedisBroker:
         result = broker.health_check()
         
         assert result is True
-        mock_client.ping.assert_called_once()
+        assert mock_client.ping.call_count == 2  # Once in __init__, once in health_check
     
     @patch('brokers.redis_broker.redis.StrictRedis')
     def test_health_check_failure(self, mock_redis):

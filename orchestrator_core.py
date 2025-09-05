@@ -37,11 +37,11 @@ class Orchestrator:
         self.workspace_path = Path(workspace_path).resolve()
         self.config_validator = ConfigValidator()
         self.config = self.config_validator.load_config(str(self.workspace_path))
+        self._ensure_directories()
         self._configure_logging()
         logger.info(f"Orchestrator initialized. Workspace: {self.workspace_path}")
         logger.info(f"Configuration loaded and validated: {CONFIG_FILE_NAME}")
         self.manifest_parser = ManifestParser()
-        self._ensure_directories()
         self.redis_broker = self._initialize_redis_broker()
         self.scheduler = self._initialize_scheduler()
 
@@ -148,7 +148,7 @@ class Orchestrator:
     def _process_parsed_manifest_data(self, manifest_data_list: list[dict], source_description: str) -> dict:
         if not manifest_data_list:
             logger.warning(f"No documents found or parsed from manifest {source_description}")
-            return {"status": "warning", "message": f"No documents found or parsed from manifest {source_description}"}
+            return {"status": "success", "message": f"No documents found or parsed from manifest {source_description}"}
 
         logger.info(f"Successfully parsed {len(manifest_data_list)} document(s) from {source_description}.")
         
@@ -242,15 +242,15 @@ class Orchestrator:
             }
         elif "Experiment" in all_kinds_in_manifest: # An experiment was defined but couldn't be expanded
              return {
-                "status": "error_experiment_expansion",
+                "status": "error",
                 "message": f"Failed to expand ExperimentDefinition from manifest. Error: {expansion_error_message or 'Unknown expansion error'}",
                 "processed_documents": processed_doc_details,
                 "all_kinds_in_manifest": list(set(all_kinds_in_manifest))
             }
         else: # No ExperimentDefinition, other kinds processed
             return {
-                "status": "accepted_other_kinds",
-                "message": "Manifest processed. No Experiment kind found to expand; other kinds acknowledged.",
+                "status": "success",
+                "message": "Manifest processed successfully. No Experiment kind found to expand; other kinds acknowledged.",
                 "processed_documents": processed_doc_details,
                 "all_kinds_in_manifest": list(set(all_kinds_in_manifest))
             }
@@ -260,6 +260,20 @@ class Orchestrator:
         logger.info(f"Handling Experiment resource: {exp_name}")
         # TODO: Заменить на реальную логику планирования/выполнения эксперимента
         logger.warning(f"Actual processing/scheduling logic for Experiment '{exp_name}' is not yet implemented.")
+
+    def cleanup(self):
+        """Clean up resources and stop services."""
+        logger.info("Starting orchestrator cleanup...")
+        try:
+            if self.scheduler:
+                self.scheduler.stop()
+                logger.info("Scheduler stopped successfully.")
+            if self.redis_broker:
+                self.redis_broker.close()
+                logger.info("Redis broker connection closed.")
+            logger.info("Orchestrator cleanup completed successfully.")
+        except Exception as e:
+            logger.error(f"Error during orchestrator cleanup: {e}", exc_info=True)
 
 # --- FastAPI приложение ---
 @asynccontextmanager

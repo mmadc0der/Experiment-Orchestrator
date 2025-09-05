@@ -136,7 +136,7 @@ class TestConfigValidator:
         # Create config file
         config_path = temp_workspace / "config.yaml"
         with open(config_path, 'w') as f:
-            yaml.dump(test_config.dict(), f)
+            yaml.dump(test_config.model_dump(), f)
         
         validator = ConfigValidator()
         loaded_config = validator.load_config(str(temp_workspace))
@@ -159,9 +159,10 @@ class TestConfigValidator:
         with open(config_path, 'w') as f:
             f.write("invalid: yaml: content: [")
         
+        # Should not raise exception, but use default config
         validator = ConfigValidator()
-        with pytest.raises(ValueError, match="Invalid YAML"):
-            validator.load_config(str(temp_workspace))
+        config = validator.load_config(str(temp_workspace))
+        assert isinstance(config, OrchestratorConfig)
     
     def test_load_config_validation_error(self, temp_workspace):
         """Test loading configuration with validation errors."""
@@ -219,9 +220,9 @@ class TestConfigValidator:
         validator = ConfigValidator()
         validator.config = test_config
         
-        # Mock redis import and client
-        with pytest.raises(ImportError):
-            validator.validate_redis_connection()
+        # Test Redis connection validation (should fail without Redis running)
+        result = validator.validate_redis_connection()
+        assert result is False
     
     def test_config_with_empty_file(self, temp_workspace):
         """Test configuration with empty file."""

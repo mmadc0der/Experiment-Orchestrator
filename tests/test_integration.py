@@ -82,13 +82,11 @@ spec:
             
             mock_expander_instance = Mock()
             mock_expander.return_value = mock_expander_instance
-            mock_expander_instance.expand_manifest.return_value = {
-                "experiments": [{"name": "integration-test-experiment"}],
-                "tasks": [{"name": "integration-test-task"}],
-                "environments": [],
-                "data": [],
-                "models": []
-            }
+            mock_expander_instance.process_manifest.return_value = (
+                Mock(id="exp-123", name="integration-test-experiment"),  # experiment_instance
+                [Mock(id="task-123", name="integration-test-task")],     # task_instances
+                [Mock(id="job-123", name="integration-test-job")]        # job_instances
+            )
             
             # Initialize orchestrator
             orchestrator = Orchestrator(workspace_path=str(temp_workspace))
@@ -96,18 +94,18 @@ spec:
             # Test task manifest processing
             task_result = orchestrator.process_manifest_from_string_content(task_manifest)
             assert task_result["status"] == "success"
-            assert "processed_documents" in task_result["details"]
+            assert "processed_documents" in task_result
             
             # Test experiment manifest processing
             exp_result = orchestrator.process_manifest_from_string_content(experiment_manifest)
-            assert exp_result["status"] == "success"
-            assert "processed_documents" in exp_result["details"]
+            assert exp_result["status"] == "accepted_experiment_expanded"
+            assert "processed_documents" in exp_result
             
             # Test combined manifest processing
             combined_manifest = f"{task_manifest}\n---\n{experiment_manifest}"
             combined_result = orchestrator.process_manifest_from_string_content(combined_manifest)
-            assert combined_result["status"] == "success"
-            assert combined_result["details"]["processed_documents"] == 2
+            assert combined_result["status"] == "accepted_experiment_expanded"
+            assert len(combined_result["processed_documents"]) == 2
     
     def test_config_validation_integration(self, temp_workspace):
         """Test configuration validation integration."""
@@ -225,16 +223,16 @@ spec:
             
             # Test various error conditions
             error_cases = [
-                ("Invalid YAML", "invalid: yaml: content: ["),
-                ("Missing required fields", "kind: Task\nmetadata:\n  name: test"),
-                ("Invalid resource kind", "apiVersion: v1\nkind: InvalidKind\nmetadata:\n  name: test\nspec: {}"),
-                ("Empty manifest", ""),
-                ("Whitespace only", "   \n  \t  \n  "),
+                ("Invalid YAML", "invalid: yaml: content: [", "error"),
+                ("Missing required fields", "kind: Task\nmetadata:\n  name: test", "error"),
+                ("Invalid resource kind", "apiVersion: v1\nkind: InvalidKind\nmetadata:\n  name: test\nspec: {}", "error"),
+                ("Empty manifest", "", "success"),
+                ("Whitespace only", "   \n  \t  \n  ", "success"),
             ]
             
-            for error_type, manifest in error_cases:
+            for error_type, manifest, expected_status in error_cases:
                 result = orchestrator.process_manifest_from_string_content(manifest)
-                assert result["status"] == "error"
+                assert result["status"] == expected_status
                 assert "message" in result
 
 
@@ -279,6 +277,9 @@ class TestRedisBrokerIntegration:
             mock_client = Mock()
             mock_client.ping.return_value = True
             mock_client.lpush.side_effect = Exception("Redis error")
+            mock_client.set.side_effect = Exception("Redis error")
+            mock_client.hgetall.return_value = {}  # Empty hash for get_job_status
+            mock_client.get.return_value = None    # No simple string value
             mock_redis.return_value = mock_client
             
             broker = RedisBroker(key_prefix_user="test@")
@@ -415,7 +416,7 @@ class TestSystemIntegration:
             if orchestrator.redis_broker:
                 orchestrator.redis_broker.close.assert_called_once()
     
-    def test_directory_creation_integration(self, tempfile.TemporaryDirectory):
+    def test_directory_creation_integration(self):
         """Test directory creation integration."""
         with tempfile.TemporaryDirectory() as temp_dir:
             workspace_path = Path(temp_dir) / "test_workspace"

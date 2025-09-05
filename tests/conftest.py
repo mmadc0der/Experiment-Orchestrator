@@ -252,7 +252,6 @@ def sample_experiment_instance() -> ExperimentInstance:
         name="test-experiment",
         experiment_definition_ref="test-experiment",
         status=InstanceStatus.PENDING,
-        created_at="2024-01-01T00:00:00Z",
         parameters={"epochs": 10, "learning_rate": 0.001}
     )
 
@@ -263,25 +262,30 @@ def sample_task_instance() -> TaskInstance:
     return TaskInstance(
         id="task-123",
         name="test-task",
-        experiment_id="exp-123",
+        name_in_pipeline="test-task",
+        experiment_instance_id="exp-123",
         task_definition_ref="test-task",
         status=InstanceStatus.PENDING,
-        created_at="2024-01-01T00:00:00Z",
-        parameters={"epochs": 10, "learning_rate": 0.001}
+        parameters={"epochs": "10", "learning_rate": "0.001"}
     )
 
 
 @pytest.fixture
 def sample_job_instance() -> JobInstance:
     """Sample job instance for testing."""
+    from models.instances import JobInstanceContext
     return JobInstance(
         id="job-123",
         name="test-job",
-        experiment_id="exp-123",
         task_instance_id="task-123",
+        job_definition_ref="test.job:TestJob",
         status=InstanceStatus.PENDING,
-        created_at="2024-01-01T00:00:00Z",
-        context=Mock()
+        context=JobInstanceContext(
+            experiment_id="exp-123",
+            task_instance_id="task-123",
+            job_instance_id="job-123",
+            job_definition_ref="test.job:TestJob"
+        )
     )
 
 
