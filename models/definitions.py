@@ -1,8 +1,13 @@
-from typing import Any, Dict, List, Optional, Literal
+from typing import Any, Dict, List, Optional, Literal, Union
 from datetime import datetime, timezone # Added timezone
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, model_validator, field_validator
 
 # --- Common Reusable Models for Definitions ---
+
+class EnvironmentVariable(BaseModel):
+    """Environment variable definition."""
+    name: str = Field(..., description="Environment variable name")
+    value: str = Field(..., description="Environment variable value")
 
 class ResourceRequirements(BaseModel):
     cpus: Optional[float] = Field(None, description="Number of CPU cores")
@@ -70,6 +75,14 @@ class TaskSpecification(BaseModel):
                     if isinstance(param_def, dict) and 'name' not in param_def:
                         param_def['name'] = param_name
         return data
+
+    @field_validator('steps')
+    @classmethod
+    def validate_steps_not_empty(cls, v):
+        """Validate that steps list is not empty."""
+        if not v:
+            raise ValueError('steps list cannot be empty')
+        return v
 
 class TaskDefinition(BaseModel):
     api_version: str = Field(..., alias="apiVersion", description="API version of the TaskDefinition schema")
@@ -142,6 +155,14 @@ class ExperimentSpecification(BaseModel):
                         param_def['name'] = param_name
         return data
 
+    @field_validator('pipeline')
+    @classmethod
+    def validate_pipeline_not_empty(cls, v):
+        """Validate that pipeline list is not empty."""
+        if not v:
+            raise ValueError('pipeline list cannot be empty')
+        return v
+
 class ExperimentDefinition(BaseModel):
     api_version: str = Field(..., alias="apiVersion", description="API version of the ExperimentDefinition schema")
     kind: Literal["Experiment"] = Field(..., description="Resource kind, must be 'Experiment'")
@@ -162,11 +183,103 @@ class ExperimentDefinition(BaseModel):
 
 # --- Unified Manifest Model (Optional, for parsing any kind) ---
 
+# --- Environment Definition ---
+
+class EnvironmentSpecification(BaseModel):
+    """Environment specification for execution environments."""
+    description: Optional[str] = Field(None, description="Environment description")
+    type: Literal["docker", "conda", "venv", "bare_metal"] = Field(..., description="Environment type")
+    image: Optional[str] = Field(None, description="Docker image name (if type: docker)")
+    python_version: Optional[str] = Field(None, alias="pythonVersion", description="Python version (if type: conda or venv)")
+    conda_env_name: Optional[str] = Field(None, alias="condaEnvName", description="Conda environment name (if type: conda)")
+    venv_path: Optional[str] = Field(None, alias="venvPath", description="Path to virtual environment (if type: venv)")
+    requirements_file: Optional[str] = Field(None, alias="requirementsFile", description="Path to dependency file")
+    setup_commands: Optional[List[str]] = Field(default_factory=list, alias="setupCommands", description="Additional setup commands")
+    env_variables: Optional[List[EnvironmentVariable]] = Field(default_factory=list, alias="envVariables", description="Environment variables")
+    
+    model_config = {
+        "populate_by_name": True,
+        "extra": "forbid"
+    }
+
+class EnvironmentDefinition(BaseModel):
+    """Environment resource definition."""
+    api_version: str = Field(..., alias="apiVersion", description="API version")
+    kind: Literal["Environment"] = Field(..., description="Resource kind")
+    metadata: Dict[str, Any] = Field(..., description="Resource metadata")
+    spec: EnvironmentSpecification
+    
+    model_config = {
+        "populate_by_name": True,
+        "extra": "forbid"
+    }
+
+# --- Data Definition ---
+
+class DataSpecification(BaseModel):
+    """Data specification for data sources."""
+    description: Optional[str] = Field(None, description="Dataset description")
+    type: Literal["torchvision_dataset", "local_files", "s3_bucket", "gcs_bucket", "database", "custom_module"] = Field(..., description="Data source type")
+    uri: Optional[str] = Field(None, description="URI to data source")
+    format: Optional[str] = Field(None, description="Data format")
+    loader_module: Optional[str] = Field(None, alias="loaderModule", description="Python module for loading data")
+    loader_function: Optional[str] = Field(None, alias="loaderFunction", description="Function name in loader module")
+    config: Optional[Dict[str, Any]] = Field(default_factory=dict, description="Configuration for data loader")
+    schema: Optional[Dict[str, Any]] = Field(None, description="Data schema description")
+    
+    model_config = {
+        "populate_by_name": True,
+        "extra": "forbid"
+    }
+
+class DataDefinition(BaseModel):
+    """Data resource definition."""
+    api_version: str = Field(..., alias="apiVersion", description="API version")
+    kind: Literal["Data"] = Field(..., description="Resource kind")
+    metadata: Dict[str, Any] = Field(..., description="Resource metadata")
+    spec: DataSpecification
+    
+    model_config = {
+        "populate_by_name": True,
+        "extra": "forbid"
+    }
+
+# --- Model Definition ---
+
+class ModelSpecification(BaseModel):
+    """Model specification for ML models."""
+    description: Optional[str] = Field(None, description="Model description")
+    source_type: Literal["module", "pretrained_hub", "onnx_file"] = Field(..., alias="sourceType", description="Model source type")
+    module_path: Optional[str] = Field(None, alias="modulePath", description="Python module path for model")
+    function_name: Optional[str] = Field(None, alias="functionName", description="Factory function name")
+    config: Optional[Dict[str, Any]] = Field(default_factory=dict, description="Model configuration")
+    input_signature: Optional[List[Dict[str, Any]]] = Field(None, alias="inputSignature", description="Input tensor signature")
+    output_signature: Optional[List[Dict[str, Any]]] = Field(None, alias="outputSignature", description="Output tensor signature")
+    
+    model_config = {
+        "populate_by_name": True,
+        "extra": "forbid"
+    }
+
+class ModelDefinition(BaseModel):
+    """Model resource definition."""
+    api_version: str = Field(..., alias="apiVersion", description="API version")
+    kind: Literal["Model"] = Field(..., description="Resource kind")
+    metadata: Dict[str, Any] = Field(..., description="Resource metadata")
+    spec: ModelSpecification
+    
+    model_config = {
+        "populate_by_name": True,
+        "extra": "forbid"
+    }
+
+# --- Unified Manifest Model (Optional, for parsing any kind) ---
+
 class AnyDefinition(BaseModel):
     api_version: str = Field(..., alias="apiVersion")
     kind: str # Keep as str to allow parsing before knowing the exact type
     metadata: Dict[str, Any]
-    spec: Dict[str, Any] # Keep as dict for now, specific parsing will cast to TaskSpecification or ExperimentSpecification
+    spec: Dict[str, Any] # Keep as dict for now, specific parsing will cast to specific specification types
 
     model_config = {
         "populate_by_name": True,

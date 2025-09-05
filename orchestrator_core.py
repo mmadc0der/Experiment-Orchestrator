@@ -10,6 +10,7 @@ from pydantic import BaseModel
 import redis # For Redis specific exceptions
 
 from logger import init_logging
+from config_validator import ConfigValidator, OrchestratorConfig
 logger = custom_logging.getLogger(__name__)
 from manifest_processing.manifest_parser import ManifestParser
 from manifest_processing.manifest_expander import ManifestExpander
@@ -34,49 +35,45 @@ class StatusResponse(BaseModel):
 class Orchestrator:
     def __init__(self, workspace_path: str | Path = "."):
         self.workspace_path = Path(workspace_path).resolve()
-        self.config = self._load_config()
+        self.config_validator = ConfigValidator()
+        self.config = self.config_validator.load_config(str(self.workspace_path))
+        self._ensure_directories()
         self._configure_logging()
         logger.info(f"Orchestrator initialized. Workspace: {self.workspace_path}")
-        logger.info(f"Configuration loaded: {CONFIG_FILE_NAME}")
+        logger.info(f"Configuration loaded and validated: {CONFIG_FILE_NAME}")
         self.manifest_parser = ManifestParser()
-        self._ensure_directories()
         self.redis_broker = self._initialize_redis_broker()
         self.scheduler = self._initialize_scheduler()
 
-    def _load_config(self) -> dict:
-        config_path = self.workspace_path / CONFIG_FILE_NAME
-        if not config_path.exists():
-            custom_logging.error(f"Configuration file not found: {config_path}")
-            return {}
-        try:
-            with open(config_path, 'r', encoding='utf-8') as f:
-                return yaml.safe_load(f)
-        except yaml.YAMLError as e:
-            custom_logging.error(f"Error parsing configuration file {config_path}: {e}")
-            return {}
-        except Exception as e:
-            custom_logging.error(f"Could not read configuration file {config_path}: {e}")
-            return {}
+    def _load_config(self) -> OrchestratorConfig:
+        """Load configuration using the config validator."""
+        return self.config_validator.load_config(str(self.workspace_path))
 
     def _configure_logging(self):
-        logging_config = self.config.get("logging", {})
-        paths_config = self.config.get("paths", {})
-        file_level_str = logging_config.get("file_level", "INFO").upper()
-        console_level_str = logging_config.get("console_level", "WARNING").upper()
-        log_format = logging_config.get("format", DEFAULT_LOG_FORMAT)
-        file_level = getattr(custom_logging, file_level_str, custom_logging.INFO)
-        console_level = getattr(custom_logging, console_level_str, custom_logging.WARNING)
-        log_dir_name = paths_config.get("log_dir", "logs")
-        self.log_dir = self.workspace_path / log_dir_name
-        rotation_config = logging_config.get("rotation", {})
-        max_bytes_str = rotation_config.get("max_bytes", "10*1024*1024")
-        try:
-            max_bytes = int(eval(max_bytes_str))
-        except Exception:
-            logger.warning(f"Could not evaluate max_bytes_str '{max_bytes_str}', using 10MB default.")
-            max_bytes = 10 * 1024 * 1024
-
-        backup_count = int(rotation_config.get("backup_count", 5))
+        """Configure logging using validated configuration."""
+        logging_config = self.config.logging
+        paths_config = self.config.paths
+        
+        file_level = getattr(custom_logging, logging_config.file_level, custom_logging.INFO)
+        console_level = getattr(custom_logging, logging_config.console_level, custom_logging.WARNING)
+        log_format = logging_config.format
+        self.log_dir = self.workspace_path / paths_config.log_dir
+        
+        # Handle rotation config
+        max_bytes = 10 * 1024 * 1024  # Default 10MB
+        backup_count = 5  # Default backup count
+        
+        if logging_config.rotation:
+            rotation_config = logging_config.rotation
+            if 'max_bytes' in rotation_config:
+                max_bytes_str = str(rotation_config['max_bytes'])
+                try:
+                    max_bytes = int(eval(max_bytes_str))
+                except Exception:
+                    logger.warning(f"Could not evaluate max_bytes_str '{max_bytes_str}', using 10MB default.")
+                    max_bytes = 10 * 1024 * 1024
+            if 'backup_count' in rotation_config:
+                backup_count = int(rotation_config['backup_count'])
         init_logging(
             file_level=file_level,
             console_level=console_level,
@@ -87,43 +84,23 @@ class Orchestrator:
         )
 
     def _ensure_directories(self):
-        paths_config = self.config.get("paths", {})
-        all_dirs_to_ensure = {paths_config.get("log_dir", "logs")}
-        for dir_key in paths_config:
-            if dir_key.endswith("_dir"):
-                 all_dirs_to_ensure.add(paths_config[dir_key])
-        
-        for dir_name in all_dirs_to_ensure:
-            dir_path = self.workspace_path / dir_name
-            try:
-                dir_path.mkdir(parents=True, exist_ok=True)
-                logger.info(f"Ensured directory exists: {dir_path}")
-            except Exception as e:
-                logger.error(f"Could not create directory {dir_path}: {e}")
+        """Ensure all required directories exist using config validator."""
+        self.config_validator.create_directories(str(self.workspace_path))
 
     def _initialize_redis_broker(self) -> RedisBroker | None:
-        redis_config = self.config.get("redis")
-        if not redis_config:
-            logger.error(f"Redis configuration ('redis:') not found in {CONFIG_FILE_NAME}. RedisBroker will not be initialized.")
-            return None
+        """Initialize Redis broker using validated configuration."""
+        redis_config = self.config.redis
         
         try:
-            host = redis_config.get("host", "localhost")
-            port = int(redis_config.get("port", 6379))
-            db = int(redis_config.get("db", 0))
-            username = redis_config.get("username") # Can be None
-            password = redis_config.get("password") # Can be None
-            key_prefix_user = redis_config.get("key_prefix_user", "")
-            
             broker = RedisBroker(
-                host=host, 
-                port=port, 
-                db=db, 
-                username=username, 
-                password=password, 
-                key_prefix_user=key_prefix_user
+                host=redis_config.host,
+                port=redis_config.port,
+                db=redis_config.db,
+                username=redis_config.username,
+                password=redis_config.password,
+                key_prefix_user=redis_config.key_prefix_user
             )
-            logger.info(f"RedisBroker initialized successfully with prefix '{key_prefix_user}'.")
+            logger.info(f"RedisBroker initialized successfully with prefix '{redis_config.key_prefix_user}'.")
             return broker
         except redis.exceptions.RedisError as e: # Catch generic Redis errors from broker's init
             logger.error(f"Failed to initialize RedisBroker: {e}. Orchestrator will continue without Redis integration for now.")
@@ -136,11 +113,12 @@ class Orchestrator:
             return None
 
     def _initialize_scheduler(self) -> Scheduler | None:
+        """Initialize scheduler using validated configuration."""
         if not self.redis_broker:
             logger.error("RedisBroker is not initialized. Scheduler cannot be started.")
             return None
         
-        scheduler_config = self.config.get("scheduler", {})
+        scheduler_config = self.config.scheduler.dict()
         try:
             scheduler_instance = Scheduler(redis_broker=self.redis_broker, config=scheduler_config)
             scheduler_instance.start()
@@ -170,7 +148,7 @@ class Orchestrator:
     def _process_parsed_manifest_data(self, manifest_data_list: list[dict], source_description: str) -> dict:
         if not manifest_data_list:
             logger.warning(f"No documents found or parsed from manifest {source_description}")
-            return {"status": "warning", "message": f"No documents found or parsed from manifest {source_description}"}
+            return {"status": "success", "message": f"No documents found or parsed from manifest {source_description}"}
 
         logger.info(f"Successfully parsed {len(manifest_data_list)} document(s) from {source_description}.")
         
@@ -264,15 +242,15 @@ class Orchestrator:
             }
         elif "Experiment" in all_kinds_in_manifest: # An experiment was defined but couldn't be expanded
              return {
-                "status": "error_experiment_expansion",
+                "status": "error",
                 "message": f"Failed to expand ExperimentDefinition from manifest. Error: {expansion_error_message or 'Unknown expansion error'}",
                 "processed_documents": processed_doc_details,
                 "all_kinds_in_manifest": list(set(all_kinds_in_manifest))
             }
         else: # No ExperimentDefinition, other kinds processed
             return {
-                "status": "accepted_other_kinds",
-                "message": "Manifest processed. No Experiment kind found to expand; other kinds acknowledged.",
+                "status": "success",
+                "message": "Manifest processed successfully. No Experiment kind found to expand; other kinds acknowledged.",
                 "processed_documents": processed_doc_details,
                 "all_kinds_in_manifest": list(set(all_kinds_in_manifest))
             }
@@ -282,6 +260,20 @@ class Orchestrator:
         logger.info(f"Handling Experiment resource: {exp_name}")
         # TODO: Заменить на реальную логику планирования/выполнения эксперимента
         logger.warning(f"Actual processing/scheduling logic for Experiment '{exp_name}' is not yet implemented.")
+
+    def cleanup(self):
+        """Clean up resources and stop services."""
+        logger.info("Starting orchestrator cleanup...")
+        try:
+            if self.scheduler:
+                self.scheduler.stop()
+                logger.info("Scheduler stopped successfully.")
+            if self.redis_broker:
+                self.redis_broker.close()
+                logger.info("Redis broker connection closed.")
+            logger.info("Orchestrator cleanup completed successfully.")
+        except Exception as e:
+            logger.error(f"Error during orchestrator cleanup: {e}", exc_info=True)
 
 # --- FastAPI приложение ---
 @asynccontextmanager

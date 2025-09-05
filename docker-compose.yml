@@ -1,0 +1,66 @@
+version: '3.8'
+
+services:
+  redis:
+    image: redis:7.0-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  orchestrator:
+    build:
+      context: .
+      target: development
+    ports:
+      - "8000:8000"
+    volumes:
+      - .:/app
+      - orchestrator_logs:/app/logs
+      - orchestrator_artifacts:/app/artifacts
+      - orchestrator_runtime:/app/runtime
+      - orchestrator_modules:/app/modules
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - REDIS_DB=0
+      - LOG_LEVEL=DEBUG
+    depends_on:
+      redis:
+        condition: service_healthy
+    command: ["python", "-m", "pytest", "tests/", "-v", "--tb=short"]
+
+  orchestrator-prod:
+    build:
+      context: .
+      target: production
+    ports:
+      - "8001:8000"
+    volumes:
+      - orchestrator_logs:/app/logs
+      - orchestrator_artifacts:/app/artifacts
+      - orchestrator_runtime:/app/runtime
+      - orchestrator_modules:/app/modules
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - REDIS_DB=0
+      - LOG_LEVEL=INFO
+    depends_on:
+      redis:
+        condition: service_healthy
+    profiles:
+      - production
+
+volumes:
+  redis_data:
+  orchestrator_logs:
+  orchestrator_artifacts:
+  orchestrator_runtime:
+  orchestrator_modules:
